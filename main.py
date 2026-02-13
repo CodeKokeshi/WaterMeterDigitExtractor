@@ -526,6 +526,11 @@ class MainWindow(QMainWindow):
         )
         view_menu.addAction(act_fit)
 
+        tool_menu = menu.addMenu("&Tool")
+        act_invert_colors = QAction("Invert Colors", self)
+        act_invert_colors.triggered.connect(self._on_invert_colors)
+        tool_menu.addAction(act_invert_colors)
+
     def _connect_signals(self):
         self.findChild(QPushButton, "btnOpenFolder").clicked.connect(
             self._on_open_folder
@@ -653,6 +658,113 @@ class MainWindow(QMainWindow):
             f"Saved {saved} segment(s) into:\n{self._output_dir}\n\n"
             f"Folders: {', '.join(sorted(set(label)))}"
         )
+
+    def _on_invert_colors(self):
+        input_parent = QFileDialog.getExistingDirectory(
+            self,
+            "Select a Folder with 0-9 Categories"
+        )
+        if not input_parent:
+            return
+
+        valid, message, digit_folders = self._validate_digit_category_parent(
+            input_parent
+        )
+        if not valid:
+            QMessageBox.warning(self, "Invalid Input Folder", message)
+            return
+
+        output_parent = QFileDialog.getExistingDirectory(
+            self,
+            "Select Output Folder"
+        )
+        if not output_parent:
+            return
+
+        processed_count, skipped_count, error_count = self._invert_category_images(
+            input_parent,
+            output_parent,
+            digit_folders
+        )
+
+        self._statusbar.showMessage(
+            f"Invert complete — processed: {processed_count}, "
+            f"skipped: {skipped_count}, errors: {error_count}"
+        )
+        QMessageBox.information(
+            self,
+            "Invert Colors Complete",
+            "Processing finished.\n\n"
+            f"Input: {input_parent}\n"
+            f"Output: {output_parent}\n"
+            f"Digit folders: {', '.join(digit_folders)}\n"
+            f"Processed images: {processed_count}\n"
+            f"Skipped non-images/unreadable: {skipped_count}\n"
+            f"Errors while saving: {error_count}"
+        )
+
+    def _validate_digit_category_parent(
+        self,
+        parent_folder: str
+    ) -> tuple[bool, str, list[str]]:
+        try:
+            children = [p for p in Path(parent_folder).iterdir() if p.is_dir()]
+        except OSError as exc:
+            return False, f"Cannot access selected folder:\n{exc}", []
+
+        if not children:
+            return (
+                False,
+                "Selected folder has no subfolders. "
+                "It must contain at least one digit-named subfolder (0-9).",
+                []
+            )
+
+        invalid_names = [p.name for p in children if not (p.name.isdigit() and len(p.name) == 1)]
+        if invalid_names:
+            return (
+                False,
+                "All direct subfolders must be a single digit name (0-9).\n\n"
+                f"Invalid subfolder(s): {', '.join(sorted(invalid_names))}",
+                []
+            )
+
+        digit_folders = sorted([p.name for p in children], key=int)
+        return True, "", digit_folders
+
+    def _invert_category_images(
+        self,
+        input_parent: str,
+        output_parent: str,
+        digit_folders: list[str]
+    ) -> tuple[int, int, int]:
+        processed_count = 0
+        skipped_count = 0
+        error_count = 0
+
+        for digit in digit_folders:
+            src_dir = Path(input_parent) / digit
+            dst_dir = Path(output_parent) / digit
+            dst_dir.mkdir(parents=True, exist_ok=True)
+
+            for entry in src_dir.iterdir():
+                if not entry.is_file() or entry.suffix.lower() not in IMAGE_EXTENSIONS:
+                    skipped_count += 1
+                    continue
+
+                src_img = cv2.imread(str(entry), cv2.IMREAD_UNCHANGED)
+                if src_img is None:
+                    skipped_count += 1
+                    continue
+
+                inverted = cv2.bitwise_not(src_img)
+                save_path = dst_dir / entry.name
+                if cv2.imwrite(str(save_path), inverted):
+                    processed_count += 1
+                else:
+                    error_count += 1
+
+        return processed_count, skipped_count, error_count
 
 
 # ---------------------------------------------------------------------------
