@@ -8,6 +8,15 @@ on:
   pull_request:
     branches: [ main, master ]
   workflow_dispatch:  # Allows manual trigger from GitHub UI
+    inputs:
+      version:
+        description: "Release version (example: 1.0.0 or v1.0.0). Leave blank to auto-generate."
+        required: false
+        type: string
+      changelog:
+        description: "Changelog entries (one line per item, no dashes needed)."
+        required: false
+        type: string
 
 jobs:
   build-windows:
@@ -107,41 +116,59 @@ jobs:
         if [[ "${{ github.ref }}" == refs/tags/* ]]; then
           # Use existing tag if this is a tag push
           echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
-          echo "is_tag=true" >> $GITHUB_OUTPUT
+        elif [[ -n "${{ github.event.inputs.version }}" ]]; then
+          INPUT_VERSION="${{ github.event.inputs.version }}"
+          if [[ "$INPUT_VERSION" == v* ]]; then
+            echo "tag=$INPUT_VERSION" >> $GITHUB_OUTPUT
+          else
+            echo "tag=v$INPUT_VERSION" >> $GITHUB_OUTPUT
+          fi
         else
-          # Auto-generate version from date and commit
-          VERSION="v$(date +'%Y.%m.%d')-${GITHUB_SHA::7}"
+          # Auto-generate semver-like version from workflow run number
+          VERSION="v1.0.${GITHUB_RUN_NUMBER}"
           echo "tag=$VERSION" >> $GITHUB_OUTPUT
-          echo "is_tag=false" >> $GITHUB_OUTPUT
         fi
+
+    - name: Build release notes
+      id: notes
+      shell: bash
+      run: |
+        RAW_CHANGELOG="${{ github.event.inputs.changelog }}"
+        if [[ -z "$RAW_CHANGELOG" ]]; then
+          RAW_CHANGELOG="${{ github.event.head_commit.message }}"
+        fi
+        if [[ -z "$RAW_CHANGELOG" ]]; then
+          RAW_CHANGELOG="Updated build artifacts"
+        fi
+
+        CHANGELOG_BULLETS=""
+        while IFS= read -r line; do
+          trimmed="$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+          if [[ -n "$trimmed" ]]; then
+            CHANGELOG_BULLETS+="- $trimmed"$'\n'
+          fi
+        done <<< "$RAW_CHANGELOG"
+
+        {
+          echo "# Five Digit-Watermeter Digit Extractor ${{ steps.version.outputs.tag }}"
+          echo
+          echo "Changelogs:"
+          echo "$CHANGELOG_BULLETS"
+          echo "Built from commit: ${{ github.sha }}"
+          echo "Branch: ${{ github.ref_name }}"
+          echo
+          echo "Downloads:"
+          echo "- Windows: DigitExtractor-Windows.zip"
+          echo "- macOS: DigitExtractor-macOS.zip"
+        } > release_body.md
     
     - name: Create Release
       uses: ncipollo/release-action@v1
       with:
         artifacts: "DigitExtractor-Windows.zip,DigitExtractor-macOS.zip"
         tag: ${{ steps.version.outputs.tag }}
-        name: "DigitExtractor ${{ steps.version.outputs.tag }}"
-        body: |
-          ## 🎉 DigitExtractor Release
-          
-          **Built from commit:** ${{ github.sha }}
-          **Branch:** ${{ github.ref_name }}
-          **Date:** ${{ github.event.head_commit.timestamp }}
-          
-          ### 📦 Downloads
-          - **Windows:** DigitExtractor-Windows.zip (Unzip and run DigitExtractor.exe)
-          - **macOS:** DigitExtractor-macOS.zip (Unzip and run DigitExtractor.app)
-          
-          ### 📝 Changes
-          ${{ github.event.head_commit.message }}
-          
-          ---
-          ### 🚀 Quick Start
-          1. Download the zip for your platform
-          2. Extract the files
-          3. Run the application (no installation needed!)
-          
-          See [USER_GUIDE.md](https://github.com/${{ github.repository }}/blob/main/USER_GUIDE.md) for usage instructions.
+        name: "Five Digit-Watermeter Digit Extractor ${{ steps.version.outputs.tag }}"
+        bodyFile: "release_body.md"
         draft: false
         prerelease: false
         allowUpdates: true
