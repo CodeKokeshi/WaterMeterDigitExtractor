@@ -6,6 +6,7 @@ PyQt6 + OpenCV application for extracting and segmenting digit images.
 import sys
 import os
 import uuid
+import importlib
 from pathlib import Path
 
 import cv2
@@ -23,7 +24,7 @@ from PyQt6.QtWidgets import (
     QGraphicsTextItem, QFileDialog, QListWidget, QListWidgetItem,
     QDockWidget, QVBoxLayout, QHBoxLayout, QWidget, QPushButton,
     QLabel, QInputDialog, QMessageBox, QStatusBar, QSplitter,
-    QGroupBox, QLineEdit, QProgressBar, QSizePolicy
+    QGroupBox, QLineEdit, QProgressBar, QSizePolicy, QSlider
 )
 
 
@@ -39,7 +40,56 @@ WARP_HI_W, WARP_HI_H = 500, 100       # high-res buffer
 FINAL_W, FINAL_H = 140, 28             # final strip size
 SEGMENT_SIZE = 28                       # each digit cell
 NUM_SEGMENTS = 5
-IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif', '.webp'}
+IMAGE_EXTENSIONS = {
+    '.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif', '.webp', '.heic', '.heif'
+}
+HEIF_DECODER_AVAILABLE = False
+_PIL_IMAGE_MODULE = None
+
+
+def _ensure_heif_decoder() -> bool:
+    """Lazily initialize HEIC/HEIF decoder dependencies."""
+    global HEIF_DECODER_AVAILABLE, _PIL_IMAGE_MODULE
+    if HEIF_DECODER_AVAILABLE:
+        return True
+
+    try:
+        pillow_heif = importlib.import_module("pillow_heif")
+        pil_image = importlib.import_module("PIL.Image")
+        pillow_heif.register_heif_opener()
+        _PIL_IMAGE_MODULE = pil_image
+        HEIF_DECODER_AVAILABLE = True
+        return True
+    except Exception:
+        return False
+
+
+def read_image_any(path: str, flags: int = cv2.IMREAD_COLOR) -> np.ndarray | None:
+    """Read common image formats with OpenCV, plus HEIC/HEIF via Pillow fallback."""
+    image = cv2.imread(path, flags)
+    if image is not None:
+        return image
+
+    ext = Path(path).suffix.lower()
+    if ext not in {'.heic', '.heif'} or not _ensure_heif_decoder():
+        return None
+
+    try:
+        with _PIL_IMAGE_MODULE.open(path) as pil_img:
+            if flags == cv2.IMREAD_GRAYSCALE:
+                return np.array(pil_img.convert("L"))
+
+            if flags == cv2.IMREAD_UNCHANGED:
+                if "A" in pil_img.getbands():
+                    rgba = np.array(pil_img.convert("RGBA"))
+                    return cv2.cvtColor(rgba, cv2.COLOR_RGBA2BGRA)
+                rgb = np.array(pil_img.convert("RGB"))
+                return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+
+            rgb = np.array(pil_img.convert("RGB"))
+            return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -177,7 +227,9 @@ class ImageViewer(QGraphicsView):
         self.setBackgroundBrush(QBrush(QColor(30, 30, 30)))
 
         self._pixmap_item: QGraphicsPixmapItem | None = None
+        self._original_cv_image: np.ndarray | None = None
         self._cv_image: np.ndarray | None = None
+        self._rotation_angle = 0
 
         # Selection state
         self._handles: list[DraggableHandle] = []
@@ -188,11 +240,49 @@ class ImageViewer(QGraphicsView):
 
     def load_image(self, path: str):
         """Load an image from disk and display it."""
-        img = cv2.imread(path, cv2.IMREAD_COLOR)
+        img = read_image_any(path, cv2.IMREAD_COLOR)
         if img is None:
+            if Path(path).suffix.lower() in {'.heic', '.heif'} and not HEIF_DECODER_AVAILABLE:
+                QMessageBox.warning(
+                    self,
+                    "Load Error",
+                    "Cannot read HEIC/HEIF image.\n"
+                    "Install HEIC support dependencies (Pillow + pillow-heif)\n"
+                    f"and try again:\n{path}",
+                )
+                return
             QMessageBox.warning(self, "Load Error", f"Cannot read:\n{path}")
             return
-        self._cv_image = img
+        self._original_cv_image = img
+        self._cv_image = img.copy()
+        self._rotation_angle = 0
+        self._render_cv_image(self._cv_image)
+        self._placing = False
+
+    def set_rotation(self, angle_deg: int) -> bool:
+        """Rotate displayed image to an absolute angle in degrees (0-359)."""
+        if self._original_cv_image is None:
+            return False
+
+        normalized = int(angle_deg) % 360
+        if normalized == self._rotation_angle:
+            return False
+
+        self._rotation_angle = normalized
+        if normalized == 0:
+            self._cv_image = self._original_cv_image.copy()
+        else:
+            self._cv_image = self._rotate_image(self._original_cv_image, normalized)
+
+        self._render_cv_image(self._cv_image)
+        self._clear_selection()
+        self._placing = False
+        self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+        return True
+
+    def _render_cv_image(self, img: np.ndarray):
+        """Render the given OpenCV image onto the graphics scene."""
         rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb.shape
         qimg = QImage(rgb.data, w, h, ch * w, QImage.Format.Format_RGB888)
@@ -204,7 +294,30 @@ class ImageViewer(QGraphicsView):
         self._pixmap_item = self._scene.addPixmap(pixmap)
         self._scene.setSceneRect(QRectF(pixmap.rect().toRectF()))
         self.fitInView(self._pixmap_item, Qt.AspectRatioMode.KeepAspectRatio)
-        self._placing = False
+
+    @staticmethod
+    def _rotate_image(image: np.ndarray, angle_deg: int) -> np.ndarray:
+        """Rotate image around center while expanding canvas to keep full content."""
+        h, w = image.shape[:2]
+        center = (w / 2.0, h / 2.0)
+        matrix = cv2.getRotationMatrix2D(center, angle_deg, 1.0)
+
+        cos_v = abs(matrix[0, 0])
+        sin_v = abs(matrix[0, 1])
+        new_w = int((h * sin_v) + (w * cos_v))
+        new_h = int((h * cos_v) + (w * sin_v))
+
+        matrix[0, 2] += (new_w / 2.0) - center[0]
+        matrix[1, 2] += (new_h / 2.0) - center[1]
+
+        return cv2.warpAffine(
+            image,
+            matrix,
+            (new_w, new_h),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=(0, 0, 0),
+        )
 
     def start_selection(self):
         """Enter point-placement mode (clear old selection)."""
@@ -451,6 +564,24 @@ class MainWindow(QMainWindow):
         self._btn_output = QPushButton("Set Output Dir…")
         ctrl_layout.addWidget(self._btn_output)
 
+        self._rotation_label = QLabel("Rotate:")
+        ctrl_layout.addWidget(self._rotation_label)
+
+        self._rotation_slider = QSlider(Qt.Orientation.Horizontal)
+        self._rotation_slider.setRange(0, 359)
+        self._rotation_slider.setSingleStep(1)
+        self._rotation_slider.setPageStep(15)
+        self._rotation_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+        self._rotation_slider.setTickInterval(30)
+        self._rotation_slider.setEnabled(False)
+        self._rotation_slider.setFixedWidth(220)
+        self._rotation_slider.setToolTip("Rotate image (0°-359°)")
+        ctrl_layout.addWidget(self._rotation_slider)
+
+        self._rotation_value = QLabel("0°")
+        self._rotation_value.setFixedWidth(40)
+        ctrl_layout.addWidget(self._rotation_value)
+
         ctrl_layout.addStretch()
 
         self._status_info = QLabel("")
@@ -540,6 +671,7 @@ class MainWindow(QMainWindow):
         self._btn_extract.clicked.connect(self._on_extract)
         self._btn_save.clicked.connect(self._on_save_segments)
         self._btn_output.clicked.connect(self._on_set_output)
+        self._rotation_slider.valueChanged.connect(self._on_rotation_changed)
         self._viewer.points_ready.connect(self._on_points_ready)
 
     # -- Slots ---------------------------------------------------------------
@@ -570,11 +702,28 @@ class MainWindow(QMainWindow):
         item = self._file_list.item(row)
         path = item.data(Qt.ItemDataRole.UserRole)
         self._viewer.load_image(path)
+        self._rotation_slider.blockSignals(True)
+        self._rotation_slider.setValue(0)
+        self._rotation_slider.blockSignals(False)
+        self._rotation_slider.setEnabled(True)
+        self._rotation_value.setText("0°")
         self._btn_select.setEnabled(True)
         self._btn_extract.setEnabled(False)
         self._btn_save.setEnabled(False)
         self._preview.clear()
         self._statusbar.showMessage(f"Viewing: {item.text()}")
+
+    def _on_rotation_changed(self, angle: int):
+        self._rotation_value.setText(f"{angle}°")
+        changed = self._viewer.set_rotation(angle)
+        if not changed:
+            return
+        self._btn_extract.setEnabled(False)
+        self._btn_save.setEnabled(False)
+        self._preview.clear()
+        self._statusbar.showMessage(
+            f"Rotation set to {angle}°. Re-select 4 points, then extract."
+        )
 
     def _on_start_select(self):
         self._viewer.start_selection()
@@ -752,7 +901,7 @@ class MainWindow(QMainWindow):
                     skipped_count += 1
                     continue
 
-                src_img = cv2.imread(str(entry), cv2.IMREAD_UNCHANGED)
+                src_img = read_image_any(str(entry), cv2.IMREAD_UNCHANGED)
                 if src_img is None:
                     skipped_count += 1
                     continue
