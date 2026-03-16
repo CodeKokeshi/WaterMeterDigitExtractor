@@ -5,12 +5,21 @@ Builds standalone executables for Windows (.exe) and macOS (.app)
 """
 
 import sys
+from pathlib import Path
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 block_cipher = None
 
 # Collect PyQt6 data files
 pyqt6_datas = collect_data_files('PyQt6')
+project_dir = Path.cwd()
+
+for icon_name in ('icon.png', 'icon.ico'):
+    icon_path = project_dir / icon_name
+    if icon_path.exists():
+        pyqt6_datas.append((str(icon_path), '.'))
+
+windows_icon = str(project_dir / 'icon.ico') if (project_dir / 'icon.ico').exists() else None
 
 # Hidden imports needed for OpenCV and PyQt6
 hidden_imports = [
@@ -62,7 +71,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    # icon='icon.ico',  # Uncomment and add icon file if available
+    icon=windows_icon,
 )
 
 coll = COLLECT(

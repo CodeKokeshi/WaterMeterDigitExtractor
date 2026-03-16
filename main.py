@@ -16,7 +16,7 @@ from PyQt6.QtCore import (
 )
 from PyQt6.QtGui import (
     QImage, QPixmap, QPen, QBrush, QColor, QPainter, QFont,
-    QAction, QKeySequence, QWheelEvent
+    QAction, QKeySequence, QWheelEvent, QIcon
 )
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QGraphicsView, QGraphicsScene,
@@ -920,8 +920,28 @@ class MainWindow(QMainWindow):
 # Entry point
 # ---------------------------------------------------------------------------
 def main():
+    if os.name == "nt":
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "com.digitextractor.app"
+            )
+        except Exception:
+            pass
+
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
+
+    base_dir = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    icon = QIcon()
+    for icon_path in (base_dir / "icon.ico", base_dir / "icon.png"):
+        if icon_path.exists():
+            candidate = QIcon(str(icon_path))
+            if not candidate.isNull():
+                icon = candidate
+                break
+    if not icon.isNull():
+        app.setWindowIcon(icon)
 
     # Dark palette for Fusion
     from PyQt6.QtGui import QPalette
@@ -940,6 +960,8 @@ def main():
     app.setPalette(palette)
 
     win = MainWindow()
+    if not icon.isNull():
+        win.setWindowIcon(icon)
     win.show()
     sys.exit(app.exec())
 
