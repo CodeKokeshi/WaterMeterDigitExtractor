@@ -409,6 +409,7 @@
           const item = await registerImage(file);
           registered.push(item);
         } catch (err) {
+          console.error("Failed to register", file.name, err);
           failed.push(`${file.name}: ${err.message}`);
         }
       }
@@ -420,7 +421,11 @@
       setBusy(false);
 
       if (folderItems.length === 0) {
-        setStatus("No images could be converted for preview.", true);
+        if (failed.length > 0) {
+          setStatus(`Failed: ${failed[0]} (check F12 console for all ${failed.length} errors)`, true);
+        } else {
+          setStatus("No images could be converted for preview.", true);
+        }
         return;
       }
 

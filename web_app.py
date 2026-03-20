@@ -284,8 +284,9 @@ async def api_register_image(
     preview_h, preview_w = preview_np.shape[:2]
 
     image_id = uuid.uuid4().hex
+    del cv_img
     IMAGE_CACHE[image_id] = {
-        "image": cv_img,
+        "raw_bytes": raw,
         "filename": image.filename or "",
         "relative_path": relative_path,
         "original_width": int(img_w),
@@ -316,7 +317,10 @@ def api_process_registered(payload: ProcessRegisteredPayload):
         raise HTTPException(status_code=400, detail=f"Malformed points: {exc}") from exc
 
     try:
-        strip, segments = process_strip(cached["image"], pts)
+        cv_img = decode_upload_bytes(cached["raw_bytes"], cached["filename"])
+        if cv_img is None:
+            raise Exception("decode_upload_bytes returned None")
+        strip, segments = process_strip(cv_img, pts)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
