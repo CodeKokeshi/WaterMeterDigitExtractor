@@ -189,7 +189,7 @@ Sizes are large because they include:
 **Important:** To build for macOS, you need a Mac. To build for Windows, you need Windows.
 
 **No Mac?** Options:
-1. Use GitHub Actions (free CI/CD) to build automatically
+1. Use the new web front (`uvicorn web_app:app`) for universal browser access
 2. Rent a cloud Mac (e.g., MacStadium, AWS EC2 Mac)
 3. Ask a friend with a Mac to run the build script
 

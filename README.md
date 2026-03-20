@@ -20,6 +20,16 @@ Extract and segment digits from images (even at angles) into clean 28×28 traini
 python main.py
 ```
 
+### Running Web Front (Universal)
+```bash
+uvicorn web_app:app --host 0.0.0.0 --port 8000
+```
+
+Then open `http://localhost:8000` in your browser.
+
+- Works on Windows, macOS, Linux, tablets, and phones (same backend pipeline)
+- Installable as a PWA from supported browsers
+
 ### Running Standalone (No Python Needed)
 - **Windows:** Double-click `DigitExtractor.exe`
 - **macOS:** Double-click `DigitExtractor.app`
@@ -57,6 +67,8 @@ python main.py
 ## 🛠️ Building from Source
 
 See [BUILD_README.md](BUILD_README.md) for creating standalone executables.
+
+Note: GitHub Actions auto-build workflow has been removed from this repository. Builds are now manual/local only.
 
 ### Dependencies
 ```bash

@@ -1,0 +1,583 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#112a46">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <title>DigitExtractor Web</title>
+  <style>
+    :root {
+      --bg: #232629;
+      --panel: #2c3136;
+      --ink: #e6e6e6;
+      --accent: #3d8bfd;
+      --accent-2: #34a853;
+      --line: #4a4f55;
+      --muted: #aeb3b8;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+      color: var(--ink);
+      background: var(--bg);
+    }
+    .wrap {
+      width: 100%;
+      min-height: 100vh;
+      padding: 12px;
+      display: grid;
+      gap: 12px;
+      grid-template-columns: 260px 1fr 360px;
+    }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px;
+    }
+    h1 { margin: 0 0 8px; font-size: 1.1rem; }
+    .sub { margin: 0 0 12px; color: var(--muted); font-size: 0.9rem; }
+    .toolbar { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
+    button, input, label {
+      font: inherit;
+    }
+    button {
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 8px 10px;
+      background: #3a3f46;
+      color: var(--ink);
+      cursor: pointer;
+    }
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+    button.primary {
+      background: var(--accent);
+      color: white;
+      border-color: var(--accent);
+    }
+    button.warn {
+      background: var(--accent-2);
+      color: white;
+      border-color: var(--accent-2);
+    }
+    #folderInput {
+      display: none;
+    }
+    .file-list {
+      list-style: none;
+      padding: 0;
+      margin: 8px 0 0;
+      max-height: calc(100vh - 120px);
+      overflow: auto;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #1f2226;
+    }
+    .file-item {
+      padding: 8px 10px;
+      border-bottom: 1px solid #31363c;
+      cursor: pointer;
+      color: #dce1e6;
+      word-break: break-word;
+    }
+    .file-item:last-child {
+      border-bottom: 0;
+    }
+    .file-item.active {
+      background: #264f78;
+    }
+    .viewer-panel {
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      gap: 8px;
+    }
+    canvas {
+      width: 100%;
+      max-height: 68vh;
+      border-radius: 6px;
+      border: 1px solid var(--line);
+      background: #1a1d20;
+      display: block;
+    }
+    .statusbar {
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 8px;
+      color: var(--muted);
+      background: #1f2226;
+      min-height: 40px;
+    }
+    .grid5 {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(56px, 1fr));
+      gap: 8px;
+      margin-top: 10px;
+    }
+    .thumb {
+      width: 100%;
+      aspect-ratio: 1 / 1;
+      border: 1px solid var(--line);
+      background: #1f2226;
+      image-rendering: pixelated;
+      object-fit: contain;
+    }
+    .field { margin-top: 10px; display: grid; gap: 6px; }
+    .field input {
+      width: 100%;
+      border: 1px solid var(--line);
+      color: var(--ink);
+      border-radius: 6px;
+      padding: 9px;
+      background: #1f2226;
+    }
+    .status {
+      margin-top: 10px;
+      min-height: 24px;
+      font-weight: 600;
+      color: var(--accent);
+    }
+    @media (max-width: 920px) {
+      .wrap { grid-template-columns: 1fr; }
+      .file-list { max-height: 200px; }
+      canvas { max-height: 46vh; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <section class="panel">
+      <h1>Images</h1>
+      <p class="sub">Open a folder and choose an image from the list.</p>
+      <div class="toolbar">
+        <input id="folderInput" type="file" webkitdirectory directory multiple>
+        <button id="openFolderBtn" class="primary">Open Folder...</button>
+      </div>
+      <ul id="fileList" class="file-list"></ul>
+    </section>
+
+    <section class="panel viewer-panel">
+      <div>
+        <h1>Viewer</h1>
+        <p class="sub">Select 4 points, then extract and preview.</p>
+        <div class="toolbar">
+          <button id="selectModeBtn">Select 4 Points</button>
+          <button id="undoBtn">Undo Point</button>
+          <button id="resetBtn">Reset Points</button>
+          <button id="processBtn" class="primary">Extract and Preview</button>
+        </div>
+      </div>
+      <canvas id="canvas"></canvas>
+      <div class="statusbar" id="statusbar"></div>
+    </section>
+
+    <section class="panel">
+      <h1>Preview and Save</h1>
+      <p class="sub">Same 140x28 strip and five 28x28 segments as desktop.</p>
+      <img id="stripPreview" alt="strip preview" style="width:100%;max-height:90px;border:1px solid var(--line);background:#1f2226;image-rendering:pixelated;object-fit:contain;">
+      <div class="grid5" id="segments"></div>
+      <div class="field">
+        <label for="labelInput">Label (exactly 5 characters)</label>
+        <input id="labelInput" maxlength="5" placeholder="A8B3Z">
+      </div>
+      <div class="field">
+        <label for="outputDirInput">Output directory on server machine</label>
+        <input id="outputDirInput" placeholder="D:/datasets/watermeter">
+      </div>
+      <div class="toolbar" style="margin-top:12px;">
+        <button id="saveBtn" class="warn">Save Segments</button>
+      </div>
+    </section>
+  </div>
+
+  <script>
+    const folderInput = document.getElementById("folderInput");
+    const openFolderBtn = document.getElementById("openFolderBtn");
+    const fileList = document.getElementById("fileList");
+    const selectModeBtn = document.getElementById("selectModeBtn");
+    const undoBtn = document.getElementById("undoBtn");
+    const resetBtn = document.getElementById("resetBtn");
+    const processBtn = document.getElementById("processBtn");
+    const saveBtn = document.getElementById("saveBtn");
+    const labelInput = document.getElementById("labelInput");
+    const outputDirInput = document.getElementById("outputDirInput");
+    const statusbar = document.getElementById("statusbar");
+    const stripPreview = document.getElementById("stripPreview");
+    const segmentsWrap = document.getElementById("segments");
+
+    const canvas = document.getElementById("canvas");
+    const ctx = canvas.getContext("2d");
+
+    const IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".webp", ".heic", ".heif"];
+
+    let folderItems = [];
+    let currentIndex = -1;
+    let imageObj = null;
+    let points = [];
+    let lastSegments = [];
+    let selectMode = false;
+    let currentImageMeta = null;
+    let preparingFolder = false;
+
+    function setStatus(msg, isError = false) {
+      statusbar.textContent = msg;
+      statusbar.style.color = isError ? "#f28b82" : "#aeb3b8";
+    }
+
+    function setBusy(isBusy) {
+      preparingFolder = isBusy;
+      openFolderBtn.disabled = isBusy;
+      processBtn.disabled = isBusy;
+      selectModeBtn.disabled = isBusy;
+      undoBtn.disabled = isBusy;
+      resetBtn.disabled = isBusy;
+      saveBtn.disabled = isBusy;
+    }
+
+    function redraw() {
+      if (!imageObj) {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        return;
+      }
+
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(imageObj, 0, 0, canvas.width, canvas.height);
+
+      ctx.lineWidth = 3;
+      ctx.strokeStyle = "#0f766e";
+      ctx.fillStyle = "#c84b31";
+
+      for (let i = 0; i < points.length; i++) {
+        const p = points[i];
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, 7, 0, Math.PI * 2);
+        ctx.fill();
+
+        ctx.fillStyle = "#12263a";
+        ctx.font = "14px Segoe UI";
+        ctx.fillText(String(i + 1), p.x + 10, p.y - 10);
+        ctx.fillStyle = "#c84b31";
+      }
+
+      if (points.length > 1) {
+        ctx.beginPath();
+        ctx.moveTo(points[0].x, points[0].y);
+        for (let i = 1; i < points.length; i++) {
+          ctx.lineTo(points[i].x, points[i].y);
+        }
+        if (points.length === 4) {
+          ctx.lineTo(points[0].x, points[0].y);
+        }
+        ctx.stroke();
+      }
+    }
+
+    function canvasToImageCoords(x, y) {
+      if (!currentImageMeta) {
+        return { x: 0, y: 0 };
+      }
+      const scaleX = currentImageMeta.originalWidth / canvas.width;
+      const scaleY = currentImageMeta.originalHeight / canvas.height;
+      return {
+        x: x * scaleX,
+        y: y * scaleY,
+      };
+    }
+
+    function isSupportedImage(file) {
+      const lower = file.name.toLowerCase();
+      return IMAGE_EXTENSIONS.some((ext) => lower.endsWith(ext));
+    }
+
+    function resetForNewImage() {
+      points = [];
+      lastSegments = [];
+      stripPreview.src = "";
+      segmentsWrap.innerHTML = "";
+      selectMode = false;
+      selectModeBtn.textContent = "Select 4 Points";
+      redraw();
+    }
+
+    function renderFileList() {
+      fileList.innerHTML = "";
+      folderItems.forEach((item, idx) => {
+        const li = document.createElement("li");
+        li.className = "file-item" + (idx === currentIndex ? " active" : "");
+        li.textContent = item.relativePath || item.filename;
+        li.addEventListener("click", () => loadImageAt(idx));
+        fileList.appendChild(li);
+      });
+    }
+
+    async function registerImage(file) {
+      const form = new FormData();
+      form.append("image", file);
+      form.append("relative_path", file.webkitRelativePath || file.name);
+
+      const res = await fetch("/api/register-image", { method: "POST", body: form });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.detail || `Failed to register ${file.name}`);
+      }
+
+      return {
+        imageId: data.image_id,
+        filename: data.filename,
+        relativePath: data.relative_path,
+        previewWebp: data.preview_webp,
+        originalWidth: data.original_width,
+        originalHeight: data.original_height,
+        previewWidth: data.preview_width,
+        previewHeight: data.preview_height,
+      };
+    }
+
+    async function loadImageAt(idx) {
+      const item = folderItems[idx];
+      if (!item) return;
+
+      currentIndex = idx;
+      currentImageMeta = item;
+      resetForNewImage();
+      renderFileList();
+
+      setStatus("Loading preview from converted cache...");
+
+      const img = new Image();
+      img.onload = () => {
+        imageObj = img;
+        const maxW = 1200;
+        const maxH = 700;
+        let w = img.naturalWidth;
+        let h = img.naturalHeight;
+        const ratio = Math.min(maxW / w, maxH / h, 1);
+        w = Math.round(w * ratio);
+        h = Math.round(h * ratio);
+        canvas.width = w;
+        canvas.height = h;
+        redraw();
+        setStatus("Image loaded. Click Select 4 Points, then place 4 corners.");
+      };
+      img.onerror = () => {
+        imageObj = null;
+        setStatus("Failed to render cached preview.", true);
+      };
+      img.src = `data:image/webp;base64,${item.previewWebp}`;
+    }
+
+    openFolderBtn.addEventListener("click", () => {
+      if (!preparingFolder) {
+        folderInput.click();
+      }
+    });
+
+    folderInput.addEventListener("change", async () => {
+      const allFiles = Array.from(folderInput.files || []);
+      const imageFiles = allFiles.filter(isSupportedImage).sort((a, b) => {
+        const an = (a.webkitRelativePath || a.name).toLowerCase();
+        const bn = (b.webkitRelativePath || b.name).toLowerCase();
+        return an.localeCompare(bn);
+      });
+
+      if (imageFiles.length === 0) {
+        folderItems = [];
+        currentIndex = -1;
+        currentImageMeta = null;
+        renderFileList();
+        setStatus("No supported images in selected folder.", true);
+        return;
+      }
+
+      setBusy(true);
+      setStatus("Resetting server cache...");
+      try {
+        await fetch("/api/reset-cache", { method: "POST" });
+      } catch (_) {
+      }
+
+      const registered = [];
+      const failed = [];
+      for (let i = 0; i < imageFiles.length; i++) {
+        const file = imageFiles[i];
+        setStatus(`Converting image ${i + 1}/${imageFiles.length}: ${file.name}`);
+        try {
+          const item = await registerImage(file);
+          registered.push(item);
+        } catch (err) {
+          failed.push(`${file.name}: ${err.message}`);
+        }
+      }
+
+      folderItems = registered;
+      currentIndex = -1;
+      currentImageMeta = null;
+      renderFileList();
+      setBusy(false);
+
+      if (folderItems.length === 0) {
+        setStatus("No images could be converted for preview.", true);
+        return;
+      }
+
+      await loadImageAt(0);
+      if (failed.length > 0) {
+        setStatus(`Loaded ${folderItems.length} image(s), skipped ${failed.length}.`, true);
+      } else {
+        setStatus(`Loaded and converted ${folderItems.length} image(s).`);
+      }
+    });
+
+    selectModeBtn.addEventListener("click", () => {
+      if (!imageObj) {
+        setStatus("Select an image first.", true);
+        return;
+      }
+      points = [];
+      selectMode = true;
+      selectModeBtn.textContent = "Selecting...";
+      redraw();
+      setStatus("Click 4 corners on the image.");
+    });
+
+    canvas.addEventListener("click", (e) => {
+      if (!imageObj) return;
+      if (!selectMode) {
+        setStatus("Click Select 4 Points first.", true);
+        return;
+      }
+      if (points.length >= 4) {
+        setStatus("Already have 4 points. Reset or undo to change.", true);
+        return;
+      }
+
+      const rect = canvas.getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      const y = e.clientY - rect.top;
+      points.push({ x, y });
+      redraw();
+
+      if (points.length === 4) {
+        selectMode = false;
+        selectModeBtn.textContent = "Select 4 Points";
+        setStatus("4 points placed. Click Extract and Preview.");
+      } else {
+        setStatus(`Point ${points.length}/4 added.`);
+      }
+    });
+
+    undoBtn.addEventListener("click", () => {
+      if (points.length > 0) {
+        points.pop();
+        redraw();
+        if (!selectMode) {
+          selectMode = true;
+          selectModeBtn.textContent = "Selecting...";
+        }
+      }
+    });
+
+    resetBtn.addEventListener("click", () => {
+      points = [];
+      selectMode = false;
+      selectModeBtn.textContent = "Select 4 Points";
+      redraw();
+      setStatus("Points cleared.");
+    });
+
+    processBtn.addEventListener("click", async () => {
+      if (!currentImageMeta || !imageObj) {
+        setStatus("Select an image first.", true);
+        return;
+      }
+      if (points.length !== 4) {
+        setStatus("You must place exactly 4 points.", true);
+        return;
+      }
+
+      const imageCoords = points.map((p) => canvasToImageCoords(p.x, p.y));
+
+      setStatus("Processing...");
+      try {
+        const res = await fetch("/api/process-registered", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            image_id: currentImageMeta.imageId,
+            points: imageCoords,
+          }),
+        });
+
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(data.detail || "Process failed");
+        }
+
+        stripPreview.src = `data:image/png;base64,${data.strip}`;
+        lastSegments = data.segments;
+        segmentsWrap.innerHTML = "";
+        data.segments.forEach((seg) => {
+          const img = document.createElement("img");
+          img.className = "thumb";
+          img.src = `data:image/png;base64,${seg}`;
+          img.alt = "segment";
+          segmentsWrap.appendChild(img);
+        });
+        setStatus("Extraction complete. You can now save segments.");
+      } catch (err) {
+        setStatus(err.message || "Process failed", true);
+      }
+    });
+
+    saveBtn.addEventListener("click", async () => {
+      const label = labelInput.value.trim();
+      const outputDir = outputDirInput.value.trim();
+
+      if (label.length !== 5) {
+        setStatus("Label must be exactly 5 characters.", true);
+        return;
+      }
+      if (lastSegments.length !== 5) {
+        setStatus("Run extraction first.", true);
+        return;
+      }
+      if (!outputDir) {
+        setStatus("Set an output directory.", true);
+        return;
+      }
+
+      setStatus("Saving...");
+      try {
+        const res = await fetch("/api/save", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            label,
+            output_dir: outputDir,
+            segments: lastSegments,
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(data.detail || "Save failed");
+        }
+        setStatus(`Saved ${data.saved} segments to ${data.output_dir}`);
+      } catch (err) {
+        setStatus(err.message || "Save failed", true);
+      }
+    });
+
+    if ("serviceWorker" in navigator) {
+      window.addEventListener("load", () => {
+        navigator.serviceWorker.register("/sw.js").catch(() => {});
+      });
+    }
+
+    setStatus("Open a folder to begin. Images are converted to preview format first.");
+  </script>
+</body>
+</html>
