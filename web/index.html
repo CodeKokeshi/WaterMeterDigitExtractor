@@ -164,6 +164,11 @@
       <div>
         <h1>Viewer</h1>
         <p class="sub">Select 4 points, then extract and preview.</p>
+        <div class="toolbar" style="margin-bottom: 10px; display: flex; align-items: center; gap: 8px;">
+          <label for="rotationSlider" style="font-size: 13px; color: #dce1e6;">Rotate:</label>
+          <input type="range" id="rotationSlider" min="0" max="359" value="0" style="flex: 1;" disabled>
+          <span id="rotationValue" style="width: 36px; font-size: 13px; color: #dce1e6;">0&deg;</span>
+        </div>
         <div class="toolbar">
           <button id="selectModeBtn">Select 4 Points</button>
           <button id="undoBtn">Undo Point</button>
@@ -205,6 +210,8 @@
     const saveBtn = document.getElementById("saveBtn");
     const labelInput = document.getElementById("labelInput");
     const outputDirInput = document.getElementById("outputDirInput");
+    const rotationSlider = document.getElementById("rotationSlider");
+    const rotationValue = document.getElementById("rotationValue");
     const statusbar = document.getElementById("statusbar");
     const stripPreview = document.getElementById("stripPreview");
     const segmentsWrap = document.getElementById("segments");
@@ -221,6 +228,9 @@
     let lastSegments = [];
     let selectMode = false;
     let currentImageMeta = null;
+    let currentRotation = 0;
+    let currentOriginalWidth = 0;
+    let currentOriginalHeight = 0;
     let preparingFolder = false;
 
     function setStatus(msg, isError = false) {
@@ -280,8 +290,8 @@
       if (!currentImageMeta) {
         return { x: 0, y: 0 };
       }
-      const scaleX = currentImageMeta.originalWidth / canvas.width;
-      const scaleY = currentImageMeta.originalHeight / canvas.height;
+      const scaleX = currentOriginalWidth / canvas.width;
+      const scaleY = currentOriginalHeight / canvas.height;
       return {
         x: x * scaleX,
         y: y * scaleY,
@@ -300,6 +310,10 @@
       segmentsWrap.innerHTML = "";
       selectMode = false;
       selectModeBtn.textContent = "Select 4 Points";
+      currentRotation = 0;
+      rotationSlider.value = 0;
+      rotationSlider.disabled = true;
+      rotationValue.innerHTML = "0&deg;";
       redraw();
     }
 
@@ -343,6 +357,8 @@
 
       currentIndex = idx;
       currentImageMeta = item;
+      currentOriginalWidth = item.originalWidth;
+      currentOriginalHeight = item.originalHeight;
       resetForNewImage();
       renderFileList();
 
@@ -360,6 +376,7 @@
         h = Math.round(h * ratio);
         canvas.width = w;
         canvas.height = h;
+        rotationSlider.disabled = false;
         redraw();
         setStatus("Image loaded. Click Select 4 Points, then place 4 corners.");
       };
@@ -461,8 +478,10 @@
       }
 
       const rect = canvas.getBoundingClientRect();
-      const x = e.clientX - rect.left;
-      const y = e.clientY - rect.top;
+      const scaleX = canvas.width / rect.width;
+      const scaleY = canvas.height / rect.height;
+      const x = (e.clientX - rect.left) * scaleX;
+      const y = (e.clientY - rect.top) * scaleY;
       points.push({ x, y });
       redraw();
 
@@ -514,6 +533,7 @@
           body: JSON.stringify({
             image_id: currentImageMeta.imageId,
             points: imageCoords,
+            rotation: currentRotation,
           }),
         });
 
@@ -573,6 +593,55 @@
         setStatus(`Saved ${data.saved} segments to ${data.output_dir}`);
       } catch (err) {
         setStatus(err.message || "Save failed", true);
+      }
+    });
+
+    rotationSlider.addEventListener("input", (e) => {
+      rotationValue.innerHTML = `${e.target.value}&deg;`;
+    });
+
+    rotationSlider.addEventListener("change", async (e) => {
+      if (!currentImageMeta) return;
+      const angle = parseInt(e.target.value, 10);
+      currentRotation = angle;
+      
+      setStatus(`Rotating image to ${angle}°...`);
+      rotationSlider.disabled = true;
+      try {
+        const res = await fetch(`/api/rotated-preview?image_id=${currentImageMeta.imageId}&angle=${angle}`);
+        if (!res.ok) throw new Error("Failed to fetch rotated preview");
+        const data = await res.json();
+        
+        currentOriginalWidth = data.original_width;
+        currentOriginalHeight = data.original_height;
+
+        const img = new Image();
+        img.onload = () => {
+          imageObj = img;
+          const maxW = 1200;
+          const maxH = 700;
+          let w = img.naturalWidth;
+          let h = img.naturalHeight;
+          const ratio = Math.min(maxW / w, maxH / h, 1);
+          canvas.width = Math.round(w * ratio);
+          canvas.height = Math.round(h * ratio);
+          
+          points = []; // Reset points for new rotation
+          selectMode = false;
+          selectModeBtn.textContent = "Select 4 Points";
+          
+          redraw();
+          rotationSlider.disabled = false;
+          setStatus(`Rotated to ${angle}°. Points reset.`);
+        };
+        img.onerror = () => {
+           setStatus("Error rendering rotated preview.", true);
+           rotationSlider.disabled = false;
+        };
+        img.src = `data:image/webp;base64,${data.preview_webp}`;
+      } catch (err) {
+        setStatus(err.message, true);
+        rotationSlider.disabled = false;
       }
     });
 

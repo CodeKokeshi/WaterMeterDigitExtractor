@@ -40,6 +40,7 @@ class SavePayload(BaseModel):
 class ProcessRegisteredPayload(BaseModel):
     image_id: str
     points: list[dict[str, float]]
+    rotation: int = 0
 
 
 def ensure_heif_decoder() -> bool:
@@ -136,6 +137,31 @@ def decode_upload_bytes(raw: bytes, filename: str = "") -> np.ndarray | None:
             return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
     except Exception:
         return None
+
+
+def rotate_image(image: np.ndarray, angle_deg: int) -> np.ndarray:
+    if angle_deg == 0:
+        return image
+    h, w = image.shape[:2]
+    center = (w / 2.0, h / 2.0)
+    matrix = cv2.getRotationMatrix2D(center, angle_deg, 1.0)
+
+    cos_v = abs(matrix[0, 0])
+    sin_v = abs(matrix[0, 1])
+    new_w = int((h * sin_v) + (w * cos_v))
+    new_h = int((h * cos_v) + (w * sin_v))
+
+    matrix[0, 2] += (new_w / 2.0) - center[0]
+    matrix[1, 2] += (new_h / 2.0) - center[1]
+
+    return cv2.warpAffine(
+        image,
+        matrix,
+        (new_w, new_h),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(0, 0, 0),
+    )
 
 
 def parse_points(points: list[dict[str, float]]) -> np.ndarray:
@@ -305,6 +331,29 @@ async def api_register_image(
     }
 
 
+@app.get("/api/rotated-preview")
+def api_rotated_preview(image_id: str, angle: int = 0):
+    cached = IMAGE_CACHE.get(image_id)
+    if cached is None:
+        raise HTTPException(status_code=404, detail="Image not in cache")
+    try:
+        cv_img = decode_upload_bytes(cached["raw_bytes"], cached["filename"])
+        if cv_img is None:
+            raise Exception("decode_upload_bytes returned None")
+        
+        rotated = rotate_image(cv_img, angle)
+        preview_h, preview_w = rotated.shape[:2]
+        preview_webp = encode_webp_base64(rotated, max_side=1800, quality=90)
+        
+        return {
+            "original_width": int(preview_w),
+            "original_height": int(preview_h),
+            "preview_webp": preview_webp,
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
 @app.post("/api/process-registered")
 def api_process_registered(payload: ProcessRegisteredPayload):
     cached = IMAGE_CACHE.get(payload.image_id)
@@ -320,7 +369,9 @@ def api_process_registered(payload: ProcessRegisteredPayload):
         cv_img = decode_upload_bytes(cached["raw_bytes"], cached["filename"])
         if cv_img is None:
             raise Exception("decode_upload_bytes returned None")
-        strip, segments = process_strip(cv_img, pts)
+        
+        rotated = rotate_image(cv_img, payload.rotation)
+        strip, segments = process_strip(rotated, pts)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
