@@ -1,2 +1,5 @@
 Rules for AI:
 1. Think outside the box to solve a problem. For example you already know that HEIC is hard to render in websites. Then why not convert it to webp first before putting it out there. That's just one example.
+2. Before using any import ensure that the packages are installed. If not, install them first.
+3. If you think you already understand something, try to explain it in your own words. If you can't, then you probably don't understand it as well as you think. And if so, try to understand it better before proceeding by reading more about it, be it in our code or online.
+4. Do not assume things that you think are good changes without seeing if it's the user's intention. Only work on the code that the user has explicitly asked you to work on and those related to it. I am talking about the changes that are so far away from the original code that they are not related to it. For example, if the user asks you to change the way the images are saved, do not change the way they are loaded. If you think that changing the way they are loaded is a good idea, then ask the user if they want you to change it before doing so.
