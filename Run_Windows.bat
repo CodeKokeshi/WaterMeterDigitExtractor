@@ -22,7 +22,7 @@ IF %ERRORLEVEL% NEQ 0 (
 
 :: Check if virtual environment exists, if not, create it
 IF NOT EXIST ".venv" (
-    echo [*] First time setup: Creating hidden local virtual environment (.venv)...
+    echo [*] First time setup: Creating hidden local virtual environment .venv ...
     python -m venv .venv
 )
 
