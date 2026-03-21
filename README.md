@@ -1,143 +1,68 @@
 # DigitExtractor
 
-**High-Precision Image Dataset Extractor** for creating 28×28 digit image datasets from perspective-distorted sources.
+**High-Precision Image Dataset Extractor** for creating robust 28x28 digit/character datasets from perspective-distorted real-world images. Perfect for building custom MNIST-style training datasets for Machine Learning models.
 
-## 🎯 What It Does
+![DigitExtractor App Interface](assets/screenshot/App.jpg)
 
-Extract and segment digits from images (even at angles) into clean 28×28 training images:
+## 🎯 Features
 
-1. **Load** a folder of images
-2. **Select** 4 corner points to define the region
-3. **Warp** perspective to 5:1 ratio (500×100 → 140×28)
-4. **Binarize** using adaptive threshold + median blur
-5. **Segment** into five 28×28 cells
-6. **Save** to labeled folders for ML training
+- **Universal Auto-Installer:** Ships with zero-touch setup wrappers for Windows (`Run_Windows.bat`) and Mac/Linux (`Run_Mac.command`) that manage a hidden, isolated python environment automatically. No Antivirus (.exe) threat detections.
+- **HEIC Image Support Ecosystem:** Fully native support for iOS `.HEIC` and `.HEIF` image arrays, bypassing standard limitations via deep Pillow integrations.
+- **Continuous 360° Rotation:** High-performance rotation slider using `cv2.getRotationMatrix2D` ensuring the image is strictly squared mathematically up-front.
+- **4-Point Perspective Warp:** Intelligently corrects lens warps and off-angle photos into a flat strip via adaptive projection mapping.
+- **Automated Segmentation Filtering:** Automatically splits the defined region into exactly five 28x28 segmented files using adaptive thresholding and 3x3 median blur for ML-ready outputs.
+- **Directory Output Mapping:** Auto-categorizes saved segments. Give it a 5-character string (e.g. `00497`), and it sorts the segments into `.../0/`, `.../4/`, `.../9/`, etc.
 
-## 🚀 Quick Start
+## 🚀 Quick Start (No Python Knowledge Required)
 
-### Running from Source
-```bash
-python main.py
-```
+You do **not** need to manually install dependencies or touch the command line.
 
-### Running Web Front (Universal)
-```bash
-uvicorn web_app:app --host 0.0.0.0 --port 8000
-```
+### Windows
+1. Unzip the downloaded folder anywhere.
+2. Double-click **`Run_Windows.bat`**.
+3. It will automatically check for Python, set up a local private environment, install the ML dependencies quietly, and launch the app.
+*(Future launches will open instantly).*
 
-Then open `http://localhost:8000` in your browser.
+### macOS / Linux
+1. Unzip the downloaded folder.
+2. Open terminal and run `chmod +x Run_Mac.command` if it needs permissions.
+3. Double-click **`Run_Mac.command`** from Finder.
+4. It seamlessly builds your local application environment and launches the UI.
 
-- Works on Windows, macOS, Linux, tablets, and phones (same backend pipeline)
-- Installable as a PWA from supported browsers
+## 📖 Usage Workflow
 
-### Running Standalone (No Python Needed)
-- **Windows:** Double-click `DigitExtractor.exe`
-- **macOS:** Double-click `DigitExtractor.app`
+1. **Load Directory:** Click **Open Folder...** to select your raw image batch (supports folders with hundreds of `.HEIC`, `.JPG`, or `.PNG` images).
+2. **Setup View:** Use the **Rotate** slider at the bottom if your image was taken upside-down or sideways. Mouse-wheel to zoom.
+3. **Locate Target:** Click **Select 4 Points**, then click the 4 corners of the digit sequence in your photo.
+4. **Extract:** Click **Extract & Preview** to see the isolated binary result.
+5. **Categorize:** Enter the text sequence seen in the image inside the label box (exactly 5 characters, e.g., `A8B3Z`). Set your base output directory.
+6. **Save:** Click **Save Segments**. The app automatically routes the cut-out digits to `/<output_dir>/<character>/segment_<uuid>.png`.
 
-## 📖 Usage
+### Output Results Example
 
-1. **File → Open Folder** — select a folder with images
-2. Click an image in the sidebar to view it
-3. **Select 4 Points** — click 4 corners of your digit strip
-   - Points auto-sort to Top-Left, Top-Right, Bottom-Right, Bottom-Left
-   - Drag handles to fine-tune
-   - Press `Esc` to cancel
-4. **Extract & Preview** — see the processed 140×28 strip and 5 segments
-5. Enter a **5-character label** (e.g., `A8B3Z`)
-6. **Set Output Dir** — choose where to save
-7. **Save Segments** — saves each digit to `/output/<char>/segment_*.png`
+ML-ready threshold extraction saves cleanly categorized images to disk.
+
+**Result - Uninverted:**
+
+![Result Not Inverted](assets/screenshot/Result%20(Not%20Inverted).png)
+
+**Result - Inverted:**
+*(Depends on raw material contrast)*
+
+![Result Inverted](assets/screenshot/Result%20(Inverted).png)
+
+## 🛠️ Technical Details & Libraries
+
+The application circumvents heavy ML pipelines in favor of pure, extremely fast computer-vision math.
+- **PyQt6 (GUI):** Advanced graphic scenes, caching, splitters, and native window rendering.
+- **OpenCV & NumPy:** Array operations, real-time matrix math for rotation, interpolation resizing, Gaussian blurring, and color-to-binary mapping.
+- **Pillow / pillow-heif:** Hard fallback mechanisms capable of handling modern iPhone imagery natively.
 
 ## ⌨️ Keyboard Shortcuts
 
-| Key | Action |
+| Shortcut | Description |
 |-----|--------|
-| `F` | Fit image to view |
-| `Esc` | Cancel selection |
-| `Ctrl+O` | Open folder |
-| Mouse wheel | Zoom in/out |
-
-## 🏗️ Technical Details
-
-- **Perspective Transform:** `cv2.getPerspectiveTransform` with auto-sorted corners
-- **High-Res Processing:** Warps to 500×100 before binarization
-- **Binarization:** Adaptive Gaussian threshold (block=11, C=2) + median blur (3×3)
-- **Downscaling:** `INTER_AREA` interpolation to 140×28
-- **Segmentation:** 5 equal 28×28 cells
-
-## 🛠️ Building from Source
-
-See [BUILD_README.md](BUILD_README.md) for creating standalone executables.
-
-Note: GitHub Actions auto-build workflow has been removed from this repository. Builds are now manual/local only.
-
-### Dependencies
-```bash
-pip install -r requirements.txt
-```
-
-- PyQt6 — GUI framework
-- OpenCV — image processing
-- NumPy — array operations
-- PyInstaller — executable builder
-
-## 📁 Project Structure
-
-```
-DigitExtractor/
-├── main.py                 # Main application
-├── requirements.txt        # Python dependencies
-├── DigitExtractor.spec     # PyInstaller configuration
-├── build_windows.ps1       # Windows build script
-├── build_mac.sh            # macOS build script
-├── BUILD_README.md         # Build instructions
-└── README.md               # This file
-```
-
-## 🎨 UI Features
-
-- **Sidebar:** Image list with quick switching
-- **Viewer:** QGraphicsView with zoom/pan
-- **Handles:** Draggable corner points with labels
-- **Preview:** Real-time display of processed strip + segments
-- **Dark Theme:** Easy on the eyes
-
-## 💡 Use Cases
-
-- Creating MNIST-style datasets from real photos
-- Extracting serial numbers from images
-- Processing distorted text/numbers from photos
-- Building custom digit recognition training data
-- Handling 3D perspective distortion in captured images
-
-## ⚠️ Important Notes
-
-- The extractor is **"blind"** — it captures exactly what's in the 4 points
-- Bars, shadows, borders stay in the data (real-world parallax)
-- Points are automatically sorted to prevent flipping
-- Processing runs in background thread (UI stays responsive)
-- Each segment saved with unique UUID filename
-
-## 🐛 Troubleshooting
-
-**Image won't load?**
-- Supports: PNG, JPG, JPEG, BMP, TIFF, WebP
-- Check file isn't corrupted
-
-**Can't click points?**
-- Click "Select 4 Points" button first
-- Make sure image is loaded
-
-**Extract button disabled?**
-- Place all 4 points first
-
-**Segments look wrong?**
-- Adjust corner handles for better alignment
-- Ensure selection covers only the digit strip
-
-## 📄 License
-
-MIT License - feel free to use in your projects!
-
-## 🤝 Contributing
-
-Built with ❤️ for ML practitioners who need clean training data.
+| `F` | Fit image to view perfectly |
+| `Esc` | Cancel 4-point selection mode |
+| `Ctrl+O` | Open a new folder |
+| `Mouse Wheel` | Pan & Zoom Canvas |
