@@ -32,7 +32,10 @@ UNREADABLE_LABEL_CHAR = "X"
 UNREADABLE_FOLDER_NAME = "Unreadable"
 ROI_RAW_DIR_NAME = "ROI_raw"
 ROI_640_DIR_NAME = "ROI_640"
+ROI_640_LABELS_DIR_NAME = "ROI_640_labels"
 ROI_SIZE = 640
+ROI_YOLO_CLASS_ID = 0
+ROI_CONTEXT_MARGIN_RATIO = 0.20
 IMAGE_EXTENSIONS = {
     '.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif', '.webp', '.heic', '.heif'
 }
@@ -153,9 +156,13 @@ def split_strip_segments(strip: np.ndarray) -> list[np.ndarray]:
     return segments
 
 
-def extract_polygon_crop(image: np.ndarray, points: np.ndarray) -> np.ndarray | None:
-    """Crop polygon ROI from rotated image without straightening/perspective transform."""
-    if image is None or points is None or len(points) != 4:
+def get_points_bounding_rect(
+    points: np.ndarray,
+    width: int,
+    height: int
+) -> tuple[int, int, int, int] | None:
+    """Get a clamped axis-aligned bounding box from the 4 selected points."""
+    if points is None or len(points) != 4:
         return None
 
     ordered = order_points(points)
@@ -163,29 +170,58 @@ def extract_polygon_crop(image: np.ndarray, points: np.ndarray) -> np.ndarray | 
     if pts.shape != (4, 2):
         return None
 
-    h, w = image.shape[:2]
-    pts[:, 0] = np.clip(pts[:, 0], 0, max(w - 1, 0))
-    pts[:, 1] = np.clip(pts[:, 1], 0, max(h - 1, 0))
-
-    mask = np.zeros((h, w), dtype=np.uint8)
-    cv2.fillPoly(mask, [pts], 255)
-    masked = cv2.bitwise_and(image, image, mask=mask)
+    pts[:, 0] = np.clip(pts[:, 0], 0, max(width - 1, 0))
+    pts[:, 1] = np.clip(pts[:, 1], 0, max(height - 1, 0))
 
     x, y, bw, bh = cv2.boundingRect(pts)
     if bw <= 0 or bh <= 0:
         return None
+    return int(x), int(y), int(bw), int(bh)
 
-    crop = masked[y:y + bh, x:x + bw]
-    if crop.size == 0:
+
+def extract_roi_crops_with_context(
+    image: np.ndarray,
+    points: np.ndarray,
+    margin_ratio: float = ROI_CONTEXT_MARGIN_RATIO,
+) -> tuple[np.ndarray, np.ndarray, tuple[int, int, int, int]] | None:
+    """Return tight ROI crop and context crop with real scene background."""
+    if image is None:
         return None
-    return crop
+
+    h, w = image.shape[:2]
+    bbox = get_points_bounding_rect(points, w, h)
+    if bbox is None:
+        return None
+
+    x, y, bw, bh = bbox
+    raw_crop = image[y:y + bh, x:x + bw].copy()
+    if raw_crop.size == 0:
+        return None
+
+    margin_x = int(round(bw * margin_ratio))
+    margin_y = int(round(bh * margin_ratio))
+    x0 = max(0, x - margin_x)
+    y0 = max(0, y - margin_y)
+    x1 = min(w, x + bw + margin_x)
+    y1 = min(h, y + bh + margin_y)
+
+    context_crop = image[y0:y1, x0:x1].copy()
+    if context_crop.size == 0:
+        return None
+
+    bbox_in_context = (x - x0, y - y0, bw, bh)
+    return raw_crop, context_crop, bbox_in_context
 
 
-def letterbox_to_square(image: np.ndarray, size: int = ROI_SIZE) -> np.ndarray:
-    """Resize to fit in a square canvas without stretching, pad with black."""
+def letterbox_to_square_with_meta(
+    image: np.ndarray,
+    size: int = ROI_SIZE,
+) -> tuple[np.ndarray, float, int, int]:
+    """Resize to fit square and pad edges by replication (avoids black borders)."""
     h, w = image.shape[:2]
     if h <= 0 or w <= 0:
-        return np.zeros((size, size, 3), dtype=np.uint8)
+        fallback = np.zeros((size, size, 3), dtype=np.uint8)
+        return fallback, 1.0, 0, 0
 
     scale = min(size / w, size / h)
     new_w = max(1, int(round(w * scale)))
@@ -194,15 +230,42 @@ def letterbox_to_square(image: np.ndarray, size: int = ROI_SIZE) -> np.ndarray:
     interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
     resized = cv2.resize(image, (new_w, new_h), interpolation=interpolation)
 
-    if len(resized.shape) == 2:
-        canvas = np.zeros((size, size), dtype=resized.dtype)
-    else:
-        canvas = np.zeros((size, size, resized.shape[2]), dtype=resized.dtype)
+    pad_left = (size - new_w) // 2
+    pad_right = size - new_w - pad_left
+    pad_top = (size - new_h) // 2
+    pad_bottom = size - new_h - pad_top
 
-    x0 = (size - new_w) // 2
-    y0 = (size - new_h) // 2
-    canvas[y0:y0 + new_h, x0:x0 + new_w] = resized
-    return canvas
+    padded = cv2.copyMakeBorder(
+        resized,
+        pad_top,
+        pad_bottom,
+        pad_left,
+        pad_right,
+        cv2.BORDER_REPLICATE,
+    )
+    return padded, scale, pad_left, pad_top
+
+
+def build_yolo_bbox_line(
+    x: float,
+    y: float,
+    width: float,
+    height: float,
+    image_width: int,
+    image_height: int,
+    class_id: int = ROI_YOLO_CLASS_ID,
+) -> str:
+    """Create one YOLO label line from pixel XYWH box coordinates."""
+    cx = (x + (width / 2.0)) / max(float(image_width), 1.0)
+    cy = (y + (height / 2.0)) / max(float(image_height), 1.0)
+    bw = width / max(float(image_width), 1.0)
+    bh = height / max(float(image_height), 1.0)
+
+    cx = float(np.clip(cx, 0.0, 1.0))
+    cy = float(np.clip(cy, 0.0, 1.0))
+    bw = float(np.clip(bw, 0.0, 1.0))
+    bh = float(np.clip(bh, 0.0, 1.0))
+    return f"{class_id} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}"
 
 
 def normalize_points(points: np.ndarray, width: int, height: int) -> np.ndarray:
@@ -1211,11 +1274,12 @@ class MainWindow(QMainWindow):
 
         roi_raw_saved = 0
         roi_640_saved = 0
+        roi_label_saved = 0
         roi_errors = 0
         current_img = self._viewer.get_cv_image()
         current_pts = self._viewer.get_points()
         if current_img is not None and current_pts is not None:
-            roi_raw_saved, roi_640_saved, roi_errors, _roi_base = self._save_roi_exports(
+            roi_raw_saved, roi_640_saved, roi_label_saved, roi_errors, _roi_base = self._save_roi_exports(
                 current_img,
                 current_pts,
                 label
@@ -1232,6 +1296,7 @@ class MainWindow(QMainWindow):
             f"Folders: {', '.join(sorted(folders_used))}\n"
             f"ROI raw saved: {roi_raw_saved}\n"
             f"ROI 640 saved: {roi_640_saved}\n"
+            f"ROI label saved: {roi_label_saved}\n"
             f"Write errors: {write_errors + roi_errors}"
         )
 
@@ -1276,6 +1341,7 @@ class MainWindow(QMainWindow):
         saved_segments = 0
         roi_raw_saved_count = 0
         roi_640_saved_count = 0
+        roi_label_saved_count = 0
         used_folders: set[str] = set()
         canceled = False
         readjust_target_path = ""
@@ -1332,13 +1398,14 @@ class MainWindow(QMainWindow):
             used_folders.update(folders_now)
             error_count += write_errors
 
-            roi_raw_saved, roi_640_saved, roi_write_errors, _roi_base = self._save_roi_exports(
+            roi_raw_saved, roi_640_saved, roi_label_saved, roi_write_errors, _roi_base = self._save_roi_exports(
                 src_img,
                 target_points,
                 label
             )
             roi_raw_saved_count += roi_raw_saved
             roi_640_saved_count += roi_640_saved
+            roi_label_saved_count += roi_label_saved
             error_count += roi_write_errors
 
             processed_images += 1
@@ -1363,6 +1430,7 @@ class MainWindow(QMainWindow):
                 f"Processed images removed from list: {processed_images}\n"
                 f"ROI raw saved so far: {roi_raw_saved_count}\n"
                 f"ROI 640 saved so far: {roi_640_saved_count}\n"
+                f"ROI labels saved so far: {roi_label_saved_count}\n"
                 f"Now focused on: {Path(readjust_target_path).name}\n\n"
                 "Rotation, zoom, and points were inherited. "
                 "Readjust the points, then click Batch Save All again to continue."
@@ -1382,6 +1450,7 @@ class MainWindow(QMainWindow):
             f"Saved segments: {saved_segments}\n"
             f"ROI raw saved: {roi_raw_saved_count}\n"
             f"ROI 640 saved: {roi_640_saved_count}\n"
+            f"ROI labels saved: {roi_label_saved_count}\n"
             f"Errors: {error_count}\n"
             f"Output: {self._output_dir}\n"
             f"Folders: {', '.join(sorted(used_folders)) if used_folders else '(none)'}"
@@ -1414,27 +1483,53 @@ class MainWindow(QMainWindow):
         rotated_image: np.ndarray,
         points: np.ndarray,
         label: str
-    ) -> tuple[int, int, int, str]:
-        crop = extract_polygon_crop(rotated_image, points)
-        if crop is None:
-            return 0, 0, 1, ""
+    ) -> tuple[int, int, int, int, str]:
+        crops = extract_roi_crops_with_context(rotated_image, points)
+        if crops is None:
+            return 0, 0, 0, 1, ""
 
-        roi_640 = letterbox_to_square(crop, ROI_SIZE)
+        raw_crop, context_crop, bbox_in_context = crops
+        roi_640, scale, pad_left, pad_top = letterbox_to_square_with_meta(context_crop, ROI_SIZE)
+
+        bx, by, bw, bh = bbox_in_context
+        bx_640 = (bx * scale) + pad_left
+        by_640 = (by * scale) + pad_top
+        bw_640 = bw * scale
+        bh_640 = bh * scale
+        yolo_line = build_yolo_bbox_line(
+            bx_640,
+            by_640,
+            bw_640,
+            bh_640,
+            ROI_SIZE,
+            ROI_SIZE,
+        )
 
         raw_dir = Path(self._output_dir) / ROI_RAW_DIR_NAME
         size_dir = Path(self._output_dir) / ROI_640_DIR_NAME
+        label_dir = Path(self._output_dir) / ROI_640_LABELS_DIR_NAME
         raw_dir.mkdir(parents=True, exist_ok=True)
         size_dir.mkdir(parents=True, exist_ok=True)
+        label_dir.mkdir(parents=True, exist_ok=True)
 
         uid = uuid.uuid4().hex[:10]
         base_name = f"{label}_{uid}"
         raw_path = raw_dir / f"{base_name}_raw.png"
         size_path = size_dir / f"{base_name}_640.png"
+        label_path = label_dir / f"{base_name}_640.txt"
 
-        raw_ok = cv2.imwrite(str(raw_path), crop)
+        raw_ok = cv2.imwrite(str(raw_path), raw_crop)
         size_ok = cv2.imwrite(str(size_path), roi_640)
+        label_ok = False
+        if size_ok:
+            try:
+                label_path.write_text(yolo_line + "\n", encoding="utf-8")
+                label_ok = True
+            except OSError:
+                label_ok = False
 
-        return int(raw_ok), int(size_ok), int((not raw_ok) + (not size_ok)), base_name
+        errors = int(not raw_ok) + int(not size_ok) + int(not label_ok)
+        return int(raw_ok), int(size_ok), int(label_ok), errors, base_name
 
     def _save_segments_with_label(
         self,
