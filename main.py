@@ -24,7 +24,8 @@ from PyQt6.QtWidgets import (
     QGraphicsTextItem, QFileDialog, QListWidget, QListWidgetItem,
     QDockWidget, QVBoxLayout, QHBoxLayout, QWidget, QPushButton,
     QLabel, QInputDialog, QMessageBox, QStatusBar, QSplitter,
-    QGroupBox, QLineEdit, QProgressBar, QSizePolicy, QSlider
+    QGroupBox, QLineEdit, QProgressBar, QSizePolicy, QSlider,
+    QCheckBox, QDialog, QDialogButtonBox
 )
 
 
@@ -40,6 +41,8 @@ WARP_HI_W, WARP_HI_H = 500, 100       # high-res buffer
 FINAL_W, FINAL_H = 140, 28             # final strip size
 SEGMENT_SIZE = 28                       # each digit cell
 NUM_SEGMENTS = 5
+UNREADABLE_LABEL_CHAR = "X"
+UNREADABLE_FOLDER_NAME = "Unreadable"
 IMAGE_EXTENSIONS = {
     '.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif', '.webp', '.heic', '.heif'
 }
@@ -107,6 +110,97 @@ def order_points(pts: np.ndarray) -> np.ndarray:
     return rect
 
 
+def extract_processed_strips(
+    image: np.ndarray,
+    points: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return both binarized strip (for saving) and grayscale strip (for readable preview)."""
+    src = order_points(points)
+    dst = np.array([
+        [0, 0],
+        [WARP_HI_W - 1, 0],
+        [WARP_HI_W - 1, WARP_HI_H - 1],
+        [0, WARP_HI_H - 1]
+    ], dtype=np.float32)
+    matrix = cv2.getPerspectiveTransform(src, dst)
+    warped = cv2.warpPerspective(image, matrix, (WARP_HI_W, WARP_HI_H))
+
+    if len(warped.shape) == 3:
+        gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = warped
+
+    preview_strip = cv2.resize(
+        gray,
+        (FINAL_W, FINAL_H),
+        interpolation=cv2.INTER_AREA
+    )
+
+    binary = cv2.adaptiveThreshold(
+        gray,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        blockSize=11,
+        C=2,
+    )
+    binary = cv2.medianBlur(binary, 3)
+    binary_strip = cv2.resize(
+        binary,
+        (FINAL_W, FINAL_H),
+        interpolation=cv2.INTER_AREA
+    )
+
+    return binary_strip, preview_strip
+
+
+def split_strip_segments(strip: np.ndarray) -> list[np.ndarray]:
+    """Split a 140x28 strip into 5 independent 28x28 cells."""
+    segments: list[np.ndarray] = []
+    for i in range(NUM_SEGMENTS):
+        x0 = i * SEGMENT_SIZE
+        segments.append(strip[:, x0:x0 + SEGMENT_SIZE].copy())
+    return segments
+
+
+def normalize_points(points: np.ndarray, width: int, height: int) -> np.ndarray:
+    """Normalize points to [0, 1] coordinates so they can be reused on other image sizes."""
+    x_den = max(width - 1, 1)
+    y_den = max(height - 1, 1)
+    normalized = points.astype(np.float32).copy()
+    normalized[:, 0] = np.clip(normalized[:, 0] / x_den, 0.0, 1.0)
+    normalized[:, 1] = np.clip(normalized[:, 1] / y_den, 0.0, 1.0)
+    return normalized
+
+
+def denormalize_points(normalized_points: np.ndarray, width: int, height: int) -> np.ndarray:
+    """Map normalized [0, 1] points onto the target image size."""
+    x_max = max(width - 1, 1)
+    y_max = max(height - 1, 1)
+    points = normalized_points.astype(np.float32).copy()
+    points[:, 0] = np.clip(points[:, 0] * x_max, 0, x_max)
+    points[:, 1] = np.clip(points[:, 1] * y_max, 0, y_max)
+    return points
+
+
+def is_digit_or_unreadable_label(label: str) -> bool:
+    normalized = label.strip().upper()
+    return len(normalized) == NUM_SEGMENTS and all(
+        ch.isdigit() or ch == UNREADABLE_LABEL_CHAR for ch in normalized
+    )
+
+
+def gray_segment_to_pixmap(
+    gray_segment: np.ndarray,
+    width: int,
+    height: int,
+    interpolation: int = cv2.INTER_NEAREST
+) -> QPixmap:
+    disp_seg = cv2.resize(gray_segment, (width, height), interpolation=interpolation)
+    qimg = QImage(disp_seg.data, width, height, width, QImage.Format.Format_Grayscale8)
+    return QPixmap.fromImage(qimg.copy())
+
+
 # ---------------------------------------------------------------------------
 # CV Processing Worker (runs on a QThread to keep UI responsive)
 # ---------------------------------------------------------------------------
@@ -126,36 +220,7 @@ class WarpWorker(QThread):
 
     def run(self):
         try:
-            src = order_points(self.points)
-            dst = np.array([
-                [0, 0],
-                [WARP_HI_W - 1, 0],
-                [WARP_HI_W - 1, WARP_HI_H - 1],
-                [0, WARP_HI_H - 1]
-            ], dtype=np.float32)
-            M = cv2.getPerspectiveTransform(src, dst)
-            warped = cv2.warpPerspective(self.image, M, (WARP_HI_W, WARP_HI_H))
-
-            # Convert to grayscale for binarization
-            if len(warped.shape) == 3:
-                gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
-            else:
-                gray = warped
-
-            # "Mirror" step — adaptive threshold + median blur while high-res
-            binary = cv2.adaptiveThreshold(
-                gray, 255,
-                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                cv2.THRESH_BINARY,
-                blockSize=11,
-                C=2,
-            )
-            binary = cv2.medianBlur(binary, 3)
-
-            # Downscale to final 140×28
-            strip = cv2.resize(binary, (FINAL_W, FINAL_H),
-                               interpolation=cv2.INTER_AREA)
-
+            strip, _preview_strip = extract_processed_strips(self.image, self.points)
             self.signals.finished.emit(strip)
         except Exception as exc:
             self.signals.error.emit(str(exc))
@@ -463,7 +528,7 @@ class PreviewWidget(QWidget):
 
     def set_strip(self, strip: np.ndarray):
         self._strip_img = strip
-        self._segments = []
+        self._segments = split_strip_segments(strip)
         # Show strip (scale up for visibility)
         disp = cv2.resize(strip, (FINAL_W * 3, FINAL_H * 3),
                           interpolation=cv2.INTER_NEAREST)
@@ -472,15 +537,8 @@ class PreviewWidget(QWidget):
         self._strip_label.setPixmap(QPixmap.fromImage(qimg))
 
         # Segment into 5 cells
-        for i in range(NUM_SEGMENTS):
-            x0 = i * SEGMENT_SIZE
-            seg = strip[:, x0:x0 + SEGMENT_SIZE]
-            self._segments.append(seg)
-            disp_seg = cv2.resize(seg, (56, 56),
-                                  interpolation=cv2.INTER_NEAREST)
-            qimg_s = QImage(disp_seg.data, 56, 56, 56,
-                            QImage.Format.Format_Grayscale8)
-            self._seg_labels[i].setPixmap(QPixmap.fromImage(qimg_s))
+        for i, seg in enumerate(self._segments):
+            self._seg_labels[i].setPixmap(gray_segment_to_pixmap(seg, 56, 56))
 
     def get_segments(self) -> list[np.ndarray]:
         return self._segments
@@ -492,6 +550,107 @@ class PreviewWidget(QWidget):
         self._strip_label.setPixmap(QPixmap())
         for lbl in self._seg_labels:
             lbl.setPixmap(QPixmap())
+
+
+class BatchLabelDialog(QDialog):
+    """Modal for fast per-image label entry during batch processing."""
+
+    def __init__(
+        self,
+        preview_segments: list[np.ndarray],
+        image_name: str,
+        image_index: int,
+        total_images: int,
+        previous_label: str,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("Batch Label Input")
+        self.setModal(True)
+        self.setMinimumWidth(760)
+
+        self._previous_label = previous_label.strip().upper()
+        self._resolved_label = ""
+
+        layout = QVBoxLayout(self)
+
+        header = QLabel(f"Image {image_index}/{total_images}: {image_name}")
+        header.setWordWrap(True)
+        layout.addWidget(header)
+
+        instructions = QLabel(
+            "Type X if the number is unreadable.\n"
+            "For example 011X3 if the 4th digit is dirty."
+        )
+        instructions.setWordWrap(True)
+        instructions.setStyleSheet("color: #f0d27a;")
+        layout.addWidget(instructions)
+
+        if self._previous_label:
+            hint = QLabel(
+                "Press Enter on an empty input to reuse previous label: "
+                f"{self._previous_label}"
+            )
+            hint.setWordWrap(True)
+            hint.setStyleSheet("color: #9fc5e8;")
+            layout.addWidget(hint)
+
+        preview_box = QGroupBox("Segment Preview (non-binarized)")
+        preview_layout = QHBoxLayout(preview_box)
+        for seg in preview_segments:
+            seg_label = QLabel()
+            seg_label.setFixedSize(78, 78)
+            seg_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            seg_label.setStyleSheet("background: #111; border: 1px solid #444;")
+            seg_label.setPixmap(
+                gray_segment_to_pixmap(seg, 72, 72, interpolation=cv2.INTER_CUBIC)
+            )
+            preview_layout.addWidget(seg_label)
+        layout.addWidget(preview_box)
+
+        self._label_input = QLineEdit()
+        self._label_input.setMaxLength(NUM_SEGMENTS)
+        self._label_input.setPlaceholderText("Enter 5 chars using 0-9 and X")
+        self._label_input.returnPressed.connect(self._on_accept)
+        layout.addWidget(self._label_input)
+
+        self._buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        self._buttons.accepted.connect(self._on_accept)
+        self._buttons.rejected.connect(self.reject)
+        layout.addWidget(self._buttons)
+
+        self._label_input.setFocus()
+
+    def _on_accept(self):
+        typed = self._label_input.text().strip().upper()
+
+        if not typed:
+            if self._previous_label:
+                self._resolved_label = self._previous_label
+                self.accept()
+                return
+            QMessageBox.warning(
+                self,
+                "Missing Label",
+                "Please enter a 5-character label for the first image."
+            )
+            return
+
+        if not is_digit_or_unreadable_label(typed):
+            QMessageBox.warning(
+                self,
+                "Invalid Label",
+                "Label must be exactly 5 characters using only digits (0-9) and X."
+            )
+            return
+
+        self._resolved_label = typed
+        self.accept()
+
+    def get_label(self) -> str:
+        return self._resolved_label
 
 
 # ---------------------------------------------------------------------------
@@ -552,10 +711,16 @@ class MainWindow(QMainWindow):
         ctrl_layout.addWidget(self._btn_extract)
 
         self._label_entry = QLineEdit()
-        self._label_entry.setPlaceholderText("5-char label (e.g. A8B3Z)")
+        self._label_entry.setPlaceholderText("5-char label (e.g. 011X9, X=Unreadable)")
         self._label_entry.setMaxLength(5)
         self._label_entry.setFixedWidth(160)
         ctrl_layout.addWidget(self._label_entry)
+
+        self._batch_checkbox = QCheckBox("Batch Processing")
+        self._batch_checkbox.setToolTip(
+            "Apply current rotation and 4-point selection to all images in this folder."
+        )
+        ctrl_layout.addWidget(self._batch_checkbox)
 
         self._btn_save = QPushButton("Save Segments")
         self._btn_save.setEnabled(False)
@@ -671,6 +836,7 @@ class MainWindow(QMainWindow):
         self._btn_extract.clicked.connect(self._on_extract)
         self._btn_save.clicked.connect(self._on_save_segments)
         self._btn_output.clicked.connect(self._on_set_output)
+        self._batch_checkbox.toggled.connect(self._on_batch_toggled)
         self._rotation_slider.valueChanged.connect(self._on_rotation_changed)
         self._viewer.points_ready.connect(self._on_points_ready)
 
@@ -734,8 +900,29 @@ class MainWindow(QMainWindow):
             "Click 4 corners on the image. Press Esc to cancel."
         )
 
+    def _on_batch_toggled(self, enabled: bool):
+        self._btn_save.setText("Batch Save All" if enabled else "Save Segments")
+        self._label_entry.setEnabled(not enabled)
+
+        if enabled:
+            self._statusbar.showMessage(
+                "Batch mode enabled. Rotate + set 4 points once, then click Batch Save All."
+            )
+            self._btn_save.setEnabled(self._viewer.get_points() is not None)
+            return
+
+        self._statusbar.showMessage("Batch mode disabled.")
+        self._btn_save.setEnabled(len(self._preview.get_segments()) == NUM_SEGMENTS)
+
     def _on_points_ready(self):
         self._btn_extract.setEnabled(True)
+        if self._batch_checkbox.isChecked():
+            self._btn_save.setEnabled(True)
+            self._statusbar.showMessage(
+                "4 points placed (auto-sorted). Batch mode ready: click Batch Save All."
+            )
+            return
+
         self._statusbar.showMessage(
             "4 points placed (auto-sorted). "
             "Drag handles to fine-tune, then click Extract."
@@ -757,6 +944,11 @@ class MainWindow(QMainWindow):
         self._preview.set_strip(strip)
         self._btn_extract.setEnabled(True)
         self._btn_save.setEnabled(True)
+        if self._batch_checkbox.isChecked():
+            self._statusbar.showMessage(
+                "Extraction complete. Batch mode is active: click Batch Save All."
+            )
+            return
         self._statusbar.showMessage(
             "Extraction complete — enter a 5-char label and save."
         )
@@ -773,7 +965,11 @@ class MainWindow(QMainWindow):
             self._statusbar.showMessage(f"Output directory: {folder}")
 
     def _on_save_segments(self):
-        label = self._label_entry.text().strip()
+        if self._batch_checkbox.isChecked():
+            self._on_batch_save_segments()
+            return
+
+        label = self._label_entry.text().strip().upper()
         if len(label) != 5:
             QMessageBox.warning(
                 self, "Invalid Label",
@@ -790,14 +986,7 @@ class MainWindow(QMainWindow):
             if not self._output_dir:
                 return
 
-        saved = 0
-        for i, seg in enumerate(segments):
-            char = label[i]
-            char_dir = os.path.join(self._output_dir, char)
-            os.makedirs(char_dir, exist_ok=True)
-            fname = f"segment_{uuid.uuid4().hex[:8]}.png"
-            cv2.imwrite(os.path.join(char_dir, fname), seg)
-            saved += 1
+        saved, folders_used, write_errors = self._save_segments_with_label(segments, label)
 
         self._statusbar.showMessage(
             f"Saved {saved} segments for label '{label}' → {self._output_dir}"
@@ -805,18 +994,158 @@ class MainWindow(QMainWindow):
         QMessageBox.information(
             self, "Saved",
             f"Saved {saved} segment(s) into:\n{self._output_dir}\n\n"
-            f"Folders: {', '.join(sorted(set(label)))}"
+            f"Folders: {', '.join(sorted(folders_used))}\n"
+            f"Write errors: {write_errors}"
         )
+
+    def _on_batch_save_segments(self):
+        if self._file_list.count() == 0:
+            QMessageBox.warning(self, "No Images", "Open a folder with images first.")
+            return
+
+        template_points = self._viewer.get_points()
+        template_image = self._viewer.get_cv_image()
+        if template_points is None or template_image is None:
+            QMessageBox.warning(
+                self,
+                "Missing Template",
+                "Batch mode needs a template. Please set 4 points on the current image first."
+            )
+            return
+
+        if not self._output_dir:
+            self._on_set_output()
+            if not self._output_dir:
+                return
+
+        template_h, template_w = template_image.shape[:2]
+        normalized_points = normalize_points(template_points, template_w, template_h)
+        rotation_angle = int(self._rotation_slider.value()) % 360
+
+        total_images = self._file_list.count()
+        previous_label = self._label_entry.text().strip().upper()
+        if previous_label and not is_digit_or_unreadable_label(previous_label):
+            previous_label = ""
+
+        processed_images = 0
+        skipped_images = 0
+        error_count = 0
+        saved_segments = 0
+        used_folders: set[str] = set()
+        canceled = False
+
+        self._statusbar.showMessage(f"Batch processing started for {total_images} images…")
+
+        for i in range(total_images):
+            item = self._file_list.item(i)
+            image_path = item.data(Qt.ItemDataRole.UserRole)
+            image_name = item.text()
+
+            src_img = read_image_any(image_path, cv2.IMREAD_COLOR)
+            if src_img is None:
+                skipped_images += 1
+                continue
+
+            if rotation_angle != 0:
+                src_img = ImageViewer._rotate_image(src_img, rotation_angle)
+
+            img_h, img_w = src_img.shape[:2]
+            target_points = denormalize_points(normalized_points, img_w, img_h)
+
+            try:
+                binary_strip, preview_strip = extract_processed_strips(src_img, target_points)
+            except Exception:
+                error_count += 1
+                continue
+
+            binary_segments = split_strip_segments(binary_strip)
+            preview_segments = split_strip_segments(preview_strip)
+
+            dialog = BatchLabelDialog(
+                preview_segments=preview_segments,
+                image_name=image_name,
+                image_index=i + 1,
+                total_images=total_images,
+                previous_label=previous_label,
+                parent=self,
+            )
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                canceled = True
+                break
+
+            label = dialog.get_label()
+            previous_label = label
+            self._label_entry.setText(label)
+
+            saved_now, folders_now, write_errors = self._save_segments_with_label(
+                binary_segments,
+                label
+            )
+            saved_segments += saved_now
+            used_folders.update(folders_now)
+            error_count += write_errors
+            processed_images += 1
+
+            self._statusbar.showMessage(
+                f"Batch progress: {processed_images}/{total_images} image(s) saved."
+            )
+            QApplication.processEvents()
+
+        result_title = "Batch Stopped" if canceled else "Batch Complete"
+        self._statusbar.showMessage(
+            f"{result_title} — images: {processed_images}/{total_images}, "
+            f"saved segments: {saved_segments}, errors: {error_count}"
+        )
+        QMessageBox.information(
+            self,
+            result_title,
+            f"Processed images: {processed_images}/{total_images}\n"
+            f"Skipped images (load failed): {skipped_images}\n"
+            f"Saved segments: {saved_segments}\n"
+            f"Errors: {error_count}\n"
+            f"Output: {self._output_dir}\n"
+            f"Folders: {', '.join(sorted(used_folders)) if used_folders else '(none)'}"
+        )
+
+    def _save_segments_with_label(
+        self,
+        segments: list[np.ndarray],
+        label: str
+    ) -> tuple[int, set[str], int]:
+        saved = 0
+        folders_used: set[str] = set()
+        write_errors = 0
+
+        for i, seg in enumerate(segments):
+            char = label[i]
+            category_folder = self._label_char_to_category_folder(char)
+            folders_used.add(category_folder)
+            char_dir = os.path.join(self._output_dir, category_folder)
+            os.makedirs(char_dir, exist_ok=True)
+            fname = f"segment_{uuid.uuid4().hex[:8]}.png"
+            save_path = os.path.join(char_dir, fname)
+            if cv2.imwrite(save_path, seg):
+                saved += 1
+            else:
+                write_errors += 1
+
+        return saved, folders_used, write_errors
+
+    @staticmethod
+    def _label_char_to_category_folder(label_char: str) -> str:
+        if label_char.upper() == UNREADABLE_LABEL_CHAR:
+            return UNREADABLE_FOLDER_NAME
+        return label_char
 
     def _on_invert_colors(self):
         input_parent = QFileDialog.getExistingDirectory(
             self,
-            "Select a Folder with 0-9 Categories"
+            "Select a Folder with 0-9 (+ optional Unreadable) Categories"
         )
         if not input_parent:
             return
 
-        valid, message, digit_folders = self._validate_digit_category_parent(
+        valid, message, category_folders = self._validate_digit_category_parent(
             input_parent
         )
         if not valid:
@@ -833,7 +1162,7 @@ class MainWindow(QMainWindow):
         processed_count, skipped_count, error_count = self._invert_category_images(
             input_parent,
             output_parent,
-            digit_folders
+            category_folders
         )
 
         self._statusbar.showMessage(
@@ -846,7 +1175,7 @@ class MainWindow(QMainWindow):
             "Processing finished.\n\n"
             f"Input: {input_parent}\n"
             f"Output: {output_parent}\n"
-            f"Digit folders: {', '.join(digit_folders)}\n"
+            f"Category folders: {', '.join(category_folders)}\n"
             f"Processed images: {processed_count}\n"
             f"Skipped non-images/unreadable: {skipped_count}\n"
             f"Errors while saving: {error_count}"
@@ -865,21 +1194,33 @@ class MainWindow(QMainWindow):
             return (
                 False,
                 "Selected folder has no subfolders. "
-                "It must contain at least one digit-named subfolder (0-9).",
+                "It must contain at least one category subfolder (0-9 or Unreadable).",
                 []
             )
 
-        invalid_names = [p.name for p in children if not (p.name.isdigit() and len(p.name) == 1)]
+        invalid_names = [
+            p.name for p in children
+            if not ((p.name.isdigit() and len(p.name) == 1) or p.name.lower() == "unreadable")
+        ]
         if invalid_names:
             return (
                 False,
-                "All direct subfolders must be a single digit name (0-9).\n\n"
+                "All direct subfolders must be a single digit name (0-9) "
+                "or Unreadable.\n\n"
                 f"Invalid subfolder(s): {', '.join(sorted(invalid_names))}",
                 []
             )
 
-        digit_folders = sorted([p.name for p in children], key=int)
-        return True, "", digit_folders
+        digit_folders = sorted(
+            [p.name for p in children if p.name.isdigit() and len(p.name) == 1],
+            key=int
+        )
+        unreadable_folders = sorted(
+            [p.name for p in children if p.name.lower() == "unreadable"],
+            key=str.lower
+        )
+        category_folders = digit_folders + unreadable_folders
+        return True, "", category_folders
 
     def _invert_category_images(
         self,
