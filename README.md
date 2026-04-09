@@ -1,68 +1,194 @@
 # DigitExtractor
 
-**High-Precision Image Dataset Extractor** for creating robust 28x28 digit/character datasets from perspective-distorted real-world images. Perfect for building custom MNIST-style training datasets for Machine Learning models.
+DigitExtractor is a PyQt6 + OpenCV desktop tool for building two datasets from the same annotation pass:
 
-![DigitExtractor App Interface](assets/screenshot/App.jpg)
+- LeNet-5 friendly digit crops (5 x 28x28 per sample)
+- YOLO friendly ROI images + label files
 
-## 🎯 Features
+It is designed for fast real-world data prep from perspective-distorted photos.
 
-- **Universal Auto-Installer:** Ships with zero-touch setup wrappers for Windows (`Run_Windows.bat`) and Mac/Linux (`Run_Mac.command`) that manage a hidden, isolated python environment automatically. No Antivirus (.exe) threat detections.
-- **HEIC Image Support Ecosystem:** Fully native support for iOS `.HEIC` and `.HEIF` image arrays, bypassing standard limitations via deep Pillow integrations.
-- **Continuous 360° Rotation:** High-performance rotation slider using `cv2.getRotationMatrix2D` ensuring the image is strictly squared mathematically up-front.
-- **4-Point Perspective Warp:** Intelligently corrects lens warps and off-angle photos into a flat strip via adaptive projection mapping.
-- **Automated Segmentation Filtering:** Automatically splits the defined region into exactly five 28x28 segmented files using adaptive thresholding and 3x3 median blur for ML-ready outputs.
-- **Directory Output Mapping:** Auto-categorizes saved segments. Give it a 5-character string (e.g. `00497`), and it sorts the segments into `.../0/`, `.../4/`, `.../9/`, etc.
+![DigitExtractor App](assets/screenshot/App.png)
 
-## 🚀 Quick Start (No Python Knowledge Required)
+## Why This Is LeNet-5 Friendly
 
-You do **not** need to manually install dependencies or touch the command line.
+- Fixed output shape per digit: 28x28 grayscale.
+- One sample always becomes 5 segments (140x28 strip split into 5 cells).
+- Clean folder-based class structure for training loaders.
+- Supports unreadable characters using X mapped to Unreadable.
+
+## Why This Is YOLO Friendly
+
+- Each saved sample also exports ROI datasets:
+  - ROI_raw (tight ROI crop)
+  - ROI_640 (square scene-context crop resized to 640x640)
+  - ROI_640_labels (YOLO txt labels)
+- Label line format is standard YOLO normalized xywh:
+
+```txt
+<class_id> <x_center> <y_center> <width> <height>
+```
+
+- Current class id is 0 by default.
+
+## Current Features
+
+- Open image folders and browse images quickly in a sidebar.
+- Supports png, jpg, jpeg, bmp, tiff, tif, webp, heic, heif.
+- HEIC/HEIF fallback support via Pillow + pillow-heif.
+- 0 to 359 degree rotation slider.
+- 4-point selection with:
+  - drag handles for fine tuning
+  - drag inside polygon to move all 4 points together
+- Extract and preview binarized strip + 28x28 segments.
+- Label validation: exactly 5 chars using only 0 to 9 and X.
+- Single-image save and batch save workflows.
+- Batch modal label entry with non-binarized preview.
+- Enter on empty batch input reuses previous label.
+- Readjust Here pauses batch, removes processed files from list, and resumes from selected image with inherited rotation + zoom + points.
+- Tool menu includes Invert Colors for dataset post-processing.
+
+## Output Structure
+
+After saving, output directory contains per-digit folders plus ROI exports.
+
+```text
+<output_dir>/
+  0/
+  1/
+  ...
+  9/
+  Unreadable/
+  ROI_raw/
+  ROI_640/
+  ROI_640_labels/
+```
+
+### Segment Files (LeNet-5 side)
+
+- Path: `<output_dir>/<digit_or_Unreadable>/segment_<8hex>.png`
+- One save operation writes 5 segment files.
+
+### ROI Files (YOLO side)
+
+- Base name: `<LABEL>_<UID>`
+- Raw ROI: `ROI_raw/<LABEL>_<UID>_raw.png`
+- 640 ROI: `ROI_640/<LABEL>_<UID>_640.png`
+- YOLO label: `ROI_640_labels/<LABEL>_<UID>_640.txt`
+
+Example:
+
+- `011X9_a1b2c3d4e5_raw.png`
+- `011X9_a1b2c3d4e5_640.png`
+- `011X9_a1b2c3d4e5_640.txt`
+
+### ROI 640 Generation Note
+
+- A square context crop is built from the real scene around the ROI bounding box.
+- Context margin ratio is 0.20.
+- If crop exceeds image bounds, reflect padding is used only to complete the square.
+- The square crop is then resized to 640x640.
+
+## Quick Start
 
 ### Windows
-1. Unzip the downloaded folder anywhere.
-2. Double-click **`Run_Windows.bat`**.
-3. It will automatically check for Python, set up a local private environment, install the ML dependencies quietly, and launch the app.
-*(Future launches will open instantly).*
+
+1. Install Python 3.10+ and ensure it is in PATH.
+2. Run one of:
+  - `Run_Windows.bat`
+  - `Run_Windows2.bat` (uses `python -m pip` for requirements install)
+3. First run creates `.venv`, installs requirements, and launches the app.
 
 ### macOS / Linux
-1. Unzip the downloaded folder.
-2. Open terminal and run `chmod +x Run_Mac.command` if it needs permissions.
-3. Double-click **`Run_Mac.command`** from Finder.
-4. It seamlessly builds your local application environment and launches the UI.
 
-## 📖 Usage Workflow
+1. Ensure Python 3 is installed.
+2. If needed: `chmod +x Run_Mac.command`
+3. Run `Run_Mac.command`.
 
-1. **Load Directory:** Click **Open Folder...** to select your raw image batch (supports folders with hundreds of `.HEIC`, `.JPG`, or `.PNG` images).
-2. **Setup View:** Use the **Rotate** slider at the bottom if your image was taken upside-down or sideways. Mouse-wheel to zoom.
-3. **Locate Target:** Click **Select 4 Points**, then click the 4 corners of the digit sequence in your photo.
-4. **Extract:** Click **Extract & Preview** to see the isolated binary result.
-5. **Categorize:** Enter the text sequence seen in the image inside the label box (exactly 5 characters, e.g., `A8B3Z`). Set your base output directory.
-6. **Save:** Click **Save Segments**. The app automatically routes the cut-out digits to `/<output_dir>/<character>/segment_<uuid>.png`.
+## Manual Run (Developer)
 
-### Output Results Example
+```bash
+python -m venv .venv
+source .venv/bin/activate  # Windows: .venv\Scripts\activate
+python -m pip install -r requirements.txt
+python main.py
+```
 
-ML-ready threshold extraction saves cleanly categorized images to disk.
+## Single Image Workflow
 
-**Result - Uninverted:**
+1. Click Open Folder and choose your image directory.
+2. Select an image from the list.
+3. Adjust Rotate if needed.
+4. Click Select 4 Points and click corners in order (auto-sorted to TL/TR/BR/BL).
+5. Click Extract and Preview.
+6. Enter label with exactly 5 chars using 0-9 and X.
+7. Click Set Output Dir if not set.
+8. Click Save Segments.
+
+## Batch Workflow (One Setup Reused)
+
+1. Load folder and pick a representative image.
+2. Set rotation and 4 points once.
+3. Enable Batch Processing.
+4. Click Batch Save All.
+5. For each image, modal appears with non-binarized segment preview:
+  - type 5-char label (0-9 and X)
+  - Enter on empty input reuses previous label
+  - use Readjust Here to pause and re-align on that image
+6. Continue until complete or cancel.
+
+## Invert Colors Tool
+
+From Tool -> Invert Colors:
+
+1. Select parent input folder containing category subfolders.
+2. Allowed subfolder names:
+  - single digits 0-9
+  - optional Unreadable
+3. Select output folder.
+4. App writes inverted copies preserving category folder names.
+
+## Controls And Shortcuts
+
+- Ctrl+O: Open folder
+- F: Fit image to view
+- Esc: Cancel / clear current 4-point selection
+- Mouse wheel: Zoom
+- Drag on canvas (normal mode): Pan
+- Drag point handles: Fine-tune corners
+- Drag inside polygon: Move all 4 points together
+
+## Dependencies
+
+- PyQt6
+- opencv-python
+- numpy
+- Pillow
+- pillow-heif
+
+See requirements.txt for version pins.
+
+## Screenshots
+
+Main UI:
+
+![Main UI](assets/screenshot/App.png)
+
+Batch processing modal flow:
+
+![Batch Processing](assets/screenshot/BatchProcessing.png)
+
+Extracted strip examples:
 
 ![Result Not Inverted](assets/screenshot/Result%20(Not%20Inverted).png)
 
-**Result - Inverted:**
-*(Depends on raw material contrast)*
-
 ![Result Inverted](assets/screenshot/Result%20(Inverted).png)
 
-## 🛠️ Technical Details & Libraries
+ROI and label structure examples:
 
-The application circumvents heavy ML pipelines in favor of pure, extremely fast computer-vision math.
-- **PyQt6 (GUI):** Advanced graphic scenes, caching, splitters, and native window rendering.
-- **OpenCV & NumPy:** Array operations, real-time matrix math for rotation, interpolation resizing, Gaussian blurring, and color-to-binary mapping.
-- **Pillow / pillow-heif:** Hard fallback mechanisms capable of handling modern iPhone imagery natively.
+![ROI Folder Labels](assets/screenshot/ROI-FolderLabels.png)
 
-## ⌨️ Keyboard Shortcuts
+![YOLO ROI](assets/screenshot/YoloROI.png)
 
-| Shortcut | Description |
-|-----|--------|
-| `F` | Fit image to view perfectly |
-| `Esc` | Cancel 4-point selection mode |
-| `Ctrl+O` | Open a new folder |
-| `Mouse Wheel` | Pan & Zoom Canvas |
+## Add More Demo Images
+
+You can add more screenshots under assets/screenshot and reference them in this README.
