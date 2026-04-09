@@ -11,22 +11,9 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from PyQt6.QtCore import (
-    Qt, QPointF, QRectF, pyqtSignal, QThread, QObject
-)
-from PyQt6.QtGui import (
-    QImage, QPixmap, QPen, QBrush, QColor, QPainter, QFont,
-    QAction, QKeySequence, QWheelEvent, QIcon
-)
-from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QGraphicsView, QGraphicsScene,
-    QGraphicsPixmapItem, QGraphicsEllipseItem, QGraphicsLineItem,
-    QGraphicsTextItem, QFileDialog, QListWidget, QListWidgetItem,
-    QDockWidget, QVBoxLayout, QHBoxLayout, QWidget, QPushButton,
-    QLabel, QInputDialog, QMessageBox, QStatusBar, QSplitter,
-    QGroupBox, QLineEdit, QProgressBar, QSizePolicy, QSlider,
-    QCheckBox, QDialog, QDialogButtonBox
-)
+from PyQt6.QtCore import *
+from PyQt6.QtGui import *
+from PyQt6.QtWidgets import *
 
 
 # ---------------------------------------------------------------------------
@@ -43,6 +30,9 @@ SEGMENT_SIZE = 28                       # each digit cell
 NUM_SEGMENTS = 5
 UNREADABLE_LABEL_CHAR = "X"
 UNREADABLE_FOLDER_NAME = "Unreadable"
+ROI_RAW_DIR_NAME = "ROI_raw"
+ROI_640_DIR_NAME = "ROI_640"
+ROI_SIZE = 640
 IMAGE_EXTENSIONS = {
     '.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif', '.webp', '.heic', '.heif'
 }
@@ -161,6 +151,58 @@ def split_strip_segments(strip: np.ndarray) -> list[np.ndarray]:
         x0 = i * SEGMENT_SIZE
         segments.append(strip[:, x0:x0 + SEGMENT_SIZE].copy())
     return segments
+
+
+def extract_polygon_crop(image: np.ndarray, points: np.ndarray) -> np.ndarray | None:
+    """Crop polygon ROI from rotated image without straightening/perspective transform."""
+    if image is None or points is None or len(points) != 4:
+        return None
+
+    ordered = order_points(points)
+    pts = np.round(ordered).astype(np.int32)
+    if pts.shape != (4, 2):
+        return None
+
+    h, w = image.shape[:2]
+    pts[:, 0] = np.clip(pts[:, 0], 0, max(w - 1, 0))
+    pts[:, 1] = np.clip(pts[:, 1], 0, max(h - 1, 0))
+
+    mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.fillPoly(mask, [pts], 255)
+    masked = cv2.bitwise_and(image, image, mask=mask)
+
+    x, y, bw, bh = cv2.boundingRect(pts)
+    if bw <= 0 or bh <= 0:
+        return None
+
+    crop = masked[y:y + bh, x:x + bw]
+    if crop.size == 0:
+        return None
+    return crop
+
+
+def letterbox_to_square(image: np.ndarray, size: int = ROI_SIZE) -> np.ndarray:
+    """Resize to fit in a square canvas without stretching, pad with black."""
+    h, w = image.shape[:2]
+    if h <= 0 or w <= 0:
+        return np.zeros((size, size, 3), dtype=np.uint8)
+
+    scale = min(size / w, size / h)
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+
+    interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+    resized = cv2.resize(image, (new_w, new_h), interpolation=interpolation)
+
+    if len(resized.shape) == 2:
+        canvas = np.zeros((size, size), dtype=resized.dtype)
+    else:
+        canvas = np.zeros((size, size, resized.shape[2]), dtype=resized.dtype)
+
+    x0 = (size - new_w) // 2
+    y0 = (size - new_h) // 2
+    canvas[y0:y0 + new_h, x0:x0 + new_w] = resized
+    return canvas
 
 
 def normalize_points(points: np.ndarray, width: int, height: int) -> np.ndarray:
@@ -295,11 +337,14 @@ class ImageViewer(QGraphicsView):
         self._original_cv_image: np.ndarray | None = None
         self._cv_image: np.ndarray | None = None
         self._rotation_angle = 0
+        self._zoom_factor = 1.0
 
         # Selection state
         self._handles: list[DraggableHandle] = []
         self._lines: list[QGraphicsLineItem] = []
         self._placing = False          # True while user is clicking corners
+        self._dragging_selection = False
+        self._drag_last_scene_pos = QPointF()
 
     # -- public API ----------------------------------------------------------
 
@@ -359,6 +404,7 @@ class ImageViewer(QGraphicsView):
         self._pixmap_item = self._scene.addPixmap(pixmap)
         self._scene.setSceneRect(QRectF(pixmap.rect().toRectF()))
         self.fitInView(self._pixmap_item, Qt.AspectRatioMode.KeepAspectRatio)
+        self._zoom_factor = 1.0
 
     @staticmethod
     def _rotate_image(image: np.ndarray, angle_deg: int) -> np.ndarray:
@@ -404,6 +450,50 @@ class ImageViewer(QGraphicsView):
     def get_cv_image(self) -> np.ndarray | None:
         return self._cv_image
 
+    def get_zoom_factor(self) -> float:
+        return self._zoom_factor
+
+    def set_zoom_factor(self, zoom_factor: float):
+        if self._pixmap_item is None:
+            return
+        target = float(max(0.1, min(zoom_factor, 20.0)))
+        if abs(target - self._zoom_factor) < 1e-6:
+            return
+        if self._zoom_factor <= 0:
+            self._zoom_factor = 1.0
+        ratio = target / self._zoom_factor
+        self.scale(ratio, ratio)
+        self._zoom_factor = target
+
+    def set_points(self, points: np.ndarray) -> bool:
+        """Set 4 handles programmatically so users can readjust instead of redeclare."""
+        if self._pixmap_item is None or points is None or points.shape != (4, 2):
+            return False
+
+        ordered = order_points(points.astype(np.float32))
+        scene_rect = self._scene.sceneRect()
+
+        self._clear_selection()
+        self._placing = False
+        self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+
+        for idx, point in enumerate(ordered):
+            x = float(np.clip(point[0], scene_rect.left(), scene_rect.right()))
+            y = float(np.clip(point[1], scene_rect.top(), scene_rect.bottom()))
+            handle = DraggableHandle(x, y, idx, self)
+            self._scene.addItem(handle)
+            self._handles.append(handle)
+
+        self._create_lines()
+        self.points_ready.emit()
+        return True
+
+    def fit_to_view(self):
+        if self._pixmap_item:
+            self.fitInView(self._pixmap_item, Qt.AspectRatioMode.KeepAspectRatio)
+            self._zoom_factor = 1.0
+
     # -- internal helpers ----------------------------------------------------
 
     def _clear_selection(self):
@@ -413,6 +503,49 @@ class ImageViewer(QGraphicsView):
             self._scene.removeItem(l)
         self._handles.clear()
         self._lines.clear()
+        self._dragging_selection = False
+
+    def _is_over_handle(self, scene_pos: QPointF) -> bool:
+        item = self._scene.itemAt(scene_pos, self.transform())
+        if isinstance(item, DraggableHandle):
+            return True
+        if item is not None and isinstance(item.parentItem(), DraggableHandle):
+            return True
+        return False
+
+    def _selection_contains_point(self, scene_pos: QPointF) -> bool:
+        if len(self._handles) != 4:
+            return False
+        polygon = QPolygonF([h.pos() for h in self._handles])
+        path = QPainterPath()
+        path.addPolygon(polygon)
+        return path.contains(scene_pos)
+
+    def _move_selection_by(self, delta: QPointF):
+        if len(self._handles) != 4:
+            return
+
+        scene_rect = self._scene.sceneRect()
+        xs = [h.pos().x() for h in self._handles]
+        ys = [h.pos().y() for h in self._handles]
+        min_x, max_x = min(xs), max(xs)
+        min_y, max_y = min(ys), max(ys)
+
+        dx = float(delta.x())
+        dy = float(delta.y())
+        dx = max(dx, scene_rect.left() - min_x)
+        dx = min(dx, scene_rect.right() - max_x)
+        dy = max(dy, scene_rect.top() - min_y)
+        dy = min(dy, scene_rect.bottom() - max_y)
+
+        if abs(dx) < 1e-6 and abs(dy) < 1e-6:
+            return
+
+        for handle in self._handles:
+            pos = handle.pos()
+            handle.setPos(pos.x() + dx, pos.y() + dy)
+
+        self.update_lines()
 
     def _add_handle(self, scene_pos: QPointF):
         idx = len(self._handles)
@@ -473,13 +606,45 @@ class ImageViewer(QGraphicsView):
     def wheelEvent(self, event: QWheelEvent):
         factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
         self.scale(factor, factor)
+        self._zoom_factor = max(0.1, min(self._zoom_factor * factor, 20.0))
 
     def mousePressEvent(self, event):
+        if (
+            not self._placing
+            and event.button() == Qt.MouseButton.LeftButton
+            and len(self._handles) == 4
+        ):
+            scene_pos = self.mapToScene(event.pos())
+            if self._selection_contains_point(scene_pos) and not self._is_over_handle(scene_pos):
+                self._dragging_selection = True
+                self._drag_last_scene_pos = scene_pos
+                self.setCursor(Qt.CursorShape.ClosedHandCursor)
+                event.accept()
+                return
+
         if self._placing and event.button() == Qt.MouseButton.LeftButton:
             scene_pos = self.mapToScene(event.pos())
             self._add_handle(scene_pos)
             return
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._dragging_selection:
+            scene_pos = self.mapToScene(event.pos())
+            delta = scene_pos - self._drag_last_scene_pos
+            self._move_selection_by(delta)
+            self._drag_last_scene_pos = self.mapToScene(event.pos())
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self._dragging_selection and event.button() == Qt.MouseButton.LeftButton:
+            self._dragging_selection = False
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Escape:
@@ -488,9 +653,7 @@ class ImageViewer(QGraphicsView):
             self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
             self.setCursor(Qt.CursorShape.ArrowCursor)
         elif event.key() == Qt.Key.Key_F:
-            if self._pixmap_item:
-                self.fitInView(self._pixmap_item,
-                               Qt.AspectRatioMode.KeepAspectRatio)
+            self.fit_to_view()
         super().keyPressEvent(event)
 
 
@@ -571,6 +734,7 @@ class BatchLabelDialog(QDialog):
 
         self._previous_label = previous_label.strip().upper()
         self._resolved_label = ""
+        self._readjust_requested = False
 
         layout = QVBoxLayout(self)
 
@@ -617,8 +781,13 @@ class BatchLabelDialog(QDialog):
         self._buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
+        self._readjust_button = self._buttons.addButton(
+            "Readjust Here",
+            QDialogButtonBox.ButtonRole.ActionRole
+        )
         self._buttons.accepted.connect(self._on_accept)
         self._buttons.rejected.connect(self.reject)
+        self._readjust_button.clicked.connect(self._on_readjust)
         layout.addWidget(self._buttons)
 
         self._label_input.setFocus()
@@ -649,8 +818,15 @@ class BatchLabelDialog(QDialog):
         self._resolved_label = typed
         self.accept()
 
+    def _on_readjust(self):
+        self._readjust_requested = True
+        self.reject()
+
     def get_label(self) -> str:
         return self._resolved_label
+
+    def readjust_requested(self) -> bool:
+        return self._readjust_requested
 
 
 # ---------------------------------------------------------------------------
@@ -663,6 +839,9 @@ class MainWindow(QMainWindow):
         self.resize(1280, 800)
         self._output_dir = ""
         self._worker: WarpWorker | None = None
+        self._pending_readjust_rotation: int | None = None
+        self._pending_readjust_points_normalized: np.ndarray | None = None
+        self._pending_readjust_zoom_factor: float | None = None
 
         self._build_ui()
         self._build_menu()
@@ -815,11 +994,7 @@ class MainWindow(QMainWindow):
         view_menu = menu.addMenu("&View")
         act_fit = QAction("Fit Image", self)
         act_fit.setShortcut(QKeySequence("F"))
-        act_fit.triggered.connect(
-            lambda: self._viewer._pixmap_item and self._viewer.fitInView(
-                self._viewer._pixmap_item, Qt.AspectRatioMode.KeepAspectRatio
-            )
-        )
+        act_fit.triggered.connect(self._viewer.fit_to_view)
         view_menu.addAction(act_fit)
 
         tool_menu = menu.addMenu("&Tool")
@@ -877,7 +1052,53 @@ class MainWindow(QMainWindow):
         self._btn_extract.setEnabled(False)
         self._btn_save.setEnabled(False)
         self._preview.clear()
+        if self._apply_pending_readjust_template_if_any():
+            self._statusbar.showMessage(
+                "Readjust template loaded. Drag points to adjust, then continue batch."
+            )
+            return
         self._statusbar.showMessage(f"Viewing: {item.text()}")
+
+    def _apply_pending_readjust_template_if_any(self) -> bool:
+        if (
+            self._pending_readjust_rotation is None
+            or self._pending_readjust_points_normalized is None
+        ):
+            return False
+
+        rotation = int(self._pending_readjust_rotation) % 360
+        points_normalized = self._pending_readjust_points_normalized.copy()
+        zoom_factor = self._pending_readjust_zoom_factor or 1.0
+
+        self._pending_readjust_rotation = None
+        self._pending_readjust_points_normalized = None
+        self._pending_readjust_zoom_factor = None
+
+        self._rotation_slider.blockSignals(True)
+        self._rotation_slider.setValue(rotation)
+        self._rotation_slider.blockSignals(False)
+        self._rotation_value.setText(f"{rotation}°")
+        self._viewer.set_rotation(rotation)
+
+        current_img = self._viewer.get_cv_image()
+        if current_img is None:
+            return False
+
+        h, w = current_img.shape[:2]
+        inherited_points = denormalize_points(points_normalized, w, h)
+        points_set = self._viewer.set_points(inherited_points)
+        self._viewer.set_zoom_factor(zoom_factor)
+        return points_set
+
+    def _set_pending_readjust_template(
+        self,
+        rotation_angle: int,
+        normalized_points: np.ndarray,
+        zoom_factor: float,
+    ):
+        self._pending_readjust_rotation = int(rotation_angle) % 360
+        self._pending_readjust_points_normalized = normalized_points.copy()
+        self._pending_readjust_zoom_factor = float(zoom_factor)
 
     def _on_rotation_changed(self, angle: int):
         self._rotation_value.setText(f"{angle}°")
@@ -970,10 +1191,10 @@ class MainWindow(QMainWindow):
             return
 
         label = self._label_entry.text().strip().upper()
-        if len(label) != 5:
+        if not is_digit_or_unreadable_label(label):
             QMessageBox.warning(
                 self, "Invalid Label",
-                "Please enter exactly 5 characters for the label."
+                "Please enter exactly 5 characters using digits (0-9) and X."
             )
             return
         segments = self._preview.get_segments()
@@ -988,6 +1209,20 @@ class MainWindow(QMainWindow):
 
         saved, folders_used, write_errors = self._save_segments_with_label(segments, label)
 
+        roi_raw_saved = 0
+        roi_640_saved = 0
+        roi_errors = 0
+        current_img = self._viewer.get_cv_image()
+        current_pts = self._viewer.get_points()
+        if current_img is not None and current_pts is not None:
+            roi_raw_saved, roi_640_saved, roi_errors, _roi_base = self._save_roi_exports(
+                current_img,
+                current_pts,
+                label
+            )
+        else:
+            roi_errors = 1
+
         self._statusbar.showMessage(
             f"Saved {saved} segments for label '{label}' → {self._output_dir}"
         )
@@ -995,7 +1230,9 @@ class MainWindow(QMainWindow):
             self, "Saved",
             f"Saved {saved} segment(s) into:\n{self._output_dir}\n\n"
             f"Folders: {', '.join(sorted(folders_used))}\n"
-            f"Write errors: {write_errors}"
+            f"ROI raw saved: {roi_raw_saved}\n"
+            f"ROI 640 saved: {roi_640_saved}\n"
+            f"Write errors: {write_errors + roi_errors}"
         )
 
     def _on_batch_save_segments(self):
@@ -1021,8 +1258,14 @@ class MainWindow(QMainWindow):
         template_h, template_w = template_image.shape[:2]
         normalized_points = normalize_points(template_points, template_w, template_h)
         rotation_angle = int(self._rotation_slider.value()) % 360
+        zoom_factor = self._viewer.get_zoom_factor()
 
-        total_images = self._file_list.count()
+        batch_items: list[tuple[str, str]] = []
+        for row in range(self._file_list.count()):
+            item = self._file_list.item(row)
+            batch_items.append((item.data(Qt.ItemDataRole.UserRole), item.text()))
+
+        total_images = len(batch_items)
         previous_label = self._label_entry.text().strip().upper()
         if previous_label and not is_digit_or_unreadable_label(previous_label):
             previous_label = ""
@@ -1031,15 +1274,16 @@ class MainWindow(QMainWindow):
         skipped_images = 0
         error_count = 0
         saved_segments = 0
+        roi_raw_saved_count = 0
+        roi_640_saved_count = 0
         used_folders: set[str] = set()
         canceled = False
+        readjust_target_path = ""
+        processed_paths: list[str] = []
 
         self._statusbar.showMessage(f"Batch processing started for {total_images} images…")
 
-        for i in range(total_images):
-            item = self._file_list.item(i)
-            image_path = item.data(Qt.ItemDataRole.UserRole)
-            image_name = item.text()
+        for i, (image_path, image_name) in enumerate(batch_items):
 
             src_img = read_image_any(image_path, cv2.IMREAD_COLOR)
             if src_img is None:
@@ -1070,7 +1314,10 @@ class MainWindow(QMainWindow):
                 parent=self,
             )
             if dialog.exec() != QDialog.DialogCode.Accepted:
-                canceled = True
+                if dialog.readjust_requested():
+                    readjust_target_path = image_path
+                else:
+                    canceled = True
                 break
 
             label = dialog.get_label()
@@ -1084,12 +1331,43 @@ class MainWindow(QMainWindow):
             saved_segments += saved_now
             used_folders.update(folders_now)
             error_count += write_errors
+
+            roi_raw_saved, roi_640_saved, roi_write_errors, _roi_base = self._save_roi_exports(
+                src_img,
+                target_points,
+                label
+            )
+            roi_raw_saved_count += roi_raw_saved
+            roi_640_saved_count += roi_640_saved
+            error_count += roi_write_errors
+
             processed_images += 1
+            processed_paths.append(image_path)
 
             self._statusbar.showMessage(
                 f"Batch progress: {processed_images}/{total_images} image(s) saved."
             )
             QApplication.processEvents()
+
+        if readjust_target_path:
+            self._set_pending_readjust_template(rotation_angle, normalized_points, zoom_factor)
+            self._remove_processed_and_focus_image(processed_paths, readjust_target_path)
+            result_title = "Batch Paused for Readjust"
+            self._statusbar.showMessage(
+                f"{result_title} — processed: {processed_images}, "
+                f"remaining in list: {self._file_list.count()}"
+            )
+            QMessageBox.information(
+                self,
+                result_title,
+                f"Processed images removed from list: {processed_images}\n"
+                f"ROI raw saved so far: {roi_raw_saved_count}\n"
+                f"ROI 640 saved so far: {roi_640_saved_count}\n"
+                f"Now focused on: {Path(readjust_target_path).name}\n\n"
+                "Rotation, zoom, and points were inherited. "
+                "Readjust the points, then click Batch Save All again to continue."
+            )
+            return
 
         result_title = "Batch Stopped" if canceled else "Batch Complete"
         self._statusbar.showMessage(
@@ -1102,10 +1380,61 @@ class MainWindow(QMainWindow):
             f"Processed images: {processed_images}/{total_images}\n"
             f"Skipped images (load failed): {skipped_images}\n"
             f"Saved segments: {saved_segments}\n"
+            f"ROI raw saved: {roi_raw_saved_count}\n"
+            f"ROI 640 saved: {roi_640_saved_count}\n"
             f"Errors: {error_count}\n"
             f"Output: {self._output_dir}\n"
             f"Folders: {', '.join(sorted(used_folders)) if used_folders else '(none)'}"
         )
+
+    def _remove_processed_and_focus_image(
+        self,
+        processed_paths: list[str],
+        focus_path: str
+    ):
+        if processed_paths:
+            processed_set = set(processed_paths)
+            for row in reversed(range(self._file_list.count())):
+                item = self._file_list.item(row)
+                path = item.data(Qt.ItemDataRole.UserRole)
+                if path in processed_set:
+                    self._file_list.takeItem(row)
+
+        for row in range(self._file_list.count()):
+            item = self._file_list.item(row)
+            if item.data(Qt.ItemDataRole.UserRole) == focus_path:
+                self._file_list.setCurrentRow(row)
+                return
+
+        if self._file_list.count() > 0:
+            self._file_list.setCurrentRow(0)
+
+    def _save_roi_exports(
+        self,
+        rotated_image: np.ndarray,
+        points: np.ndarray,
+        label: str
+    ) -> tuple[int, int, int, str]:
+        crop = extract_polygon_crop(rotated_image, points)
+        if crop is None:
+            return 0, 0, 1, ""
+
+        roi_640 = letterbox_to_square(crop, ROI_SIZE)
+
+        raw_dir = Path(self._output_dir) / ROI_RAW_DIR_NAME
+        size_dir = Path(self._output_dir) / ROI_640_DIR_NAME
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        size_dir.mkdir(parents=True, exist_ok=True)
+
+        uid = uuid.uuid4().hex[:10]
+        base_name = f"{label}_{uid}"
+        raw_path = raw_dir / f"{base_name}_raw.png"
+        size_path = size_dir / f"{base_name}_640.png"
+
+        raw_ok = cv2.imwrite(str(raw_path), crop)
+        size_ok = cv2.imwrite(str(size_path), roi_640)
+
+        return int(raw_ok), int(size_ok), int((not raw_ok) + (not size_ok)), base_name
 
     def _save_segments_with_label(
         self,
