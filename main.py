@@ -184,7 +184,7 @@ def extract_roi_crops_with_context(
     points: np.ndarray,
     margin_ratio: float = ROI_CONTEXT_MARGIN_RATIO,
 ) -> tuple[np.ndarray, np.ndarray, tuple[int, int, int, int]] | None:
-    """Return tight ROI crop and context crop with real scene background."""
+    """Return tight ROI crop and square context crop from the real scene."""
     if image is None:
         return None
 
@@ -198,52 +198,65 @@ def extract_roi_crops_with_context(
     if raw_crop.size == 0:
         return None
 
-    margin_x = int(round(bw * margin_ratio))
-    margin_y = int(round(bh * margin_ratio))
-    x0 = max(0, x - margin_x)
-    y0 = max(0, y - margin_y)
-    x1 = min(w, x + bw + margin_x)
-    y1 = min(h, y + bh + margin_y)
+    side = int(round(max(bw, bh) * (1.0 + (2.0 * margin_ratio))))
+    side = max(side, bw, bh, 1)
 
-    context_crop = image[y0:y1, x0:x1].copy()
-    if context_crop.size == 0:
+    cx = x + (bw / 2.0)
+    cy = y + (bh / 2.0)
+    x0 = int(round(cx - (side / 2.0)))
+    y0 = int(round(cy - (side / 2.0)))
+    x1 = x0 + side
+    y1 = y0 + side
+
+    pad_left = max(0, -x0)
+    pad_top = max(0, -y0)
+    pad_right = max(0, x1 - w)
+    pad_bottom = max(0, y1 - h)
+
+    if pad_left or pad_top or pad_right or pad_bottom:
+        image_for_crop = cv2.copyMakeBorder(
+            image,
+            pad_top,
+            pad_bottom,
+            pad_left,
+            pad_right,
+            cv2.BORDER_REFLECT_101,
+        )
+    else:
+        image_for_crop = image
+
+    x0 += pad_left
+    y0 += pad_top
+    x1 += pad_left
+    y1 += pad_top
+
+    square_context_crop = image_for_crop[y0:y1, x0:x1].copy()
+    if square_context_crop.size == 0:
         return None
 
-    bbox_in_context = (x - x0, y - y0, bw, bh)
-    return raw_crop, context_crop, bbox_in_context
+    bbox_in_square = (
+        (x + pad_left) - x0,
+        (y + pad_top) - y0,
+        bw,
+        bh,
+    )
+    return raw_crop, square_context_crop, bbox_in_square
 
 
 def letterbox_to_square_with_meta(
     image: np.ndarray,
     size: int = ROI_SIZE,
 ) -> tuple[np.ndarray, float, int, int]:
-    """Resize to fit square and pad edges by replication (avoids black borders)."""
+    """Resize a square scene crop to target size without synthetic fill."""
     h, w = image.shape[:2]
     if h <= 0 or w <= 0:
         fallback = np.zeros((size, size, 3), dtype=np.uint8)
         return fallback, 1.0, 0, 0
 
-    scale = min(size / w, size / h)
-    new_w = max(1, int(round(w * scale)))
-    new_h = max(1, int(round(h * scale)))
-
+    scale = size / max(float(w), float(h))
     interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
-    resized = cv2.resize(image, (new_w, new_h), interpolation=interpolation)
-
-    pad_left = (size - new_w) // 2
-    pad_right = size - new_w - pad_left
-    pad_top = (size - new_h) // 2
-    pad_bottom = size - new_h - pad_top
-
-    padded = cv2.copyMakeBorder(
-        resized,
-        pad_top,
-        pad_bottom,
-        pad_left,
-        pad_right,
-        cv2.BORDER_REPLICATE,
-    )
-    return padded, scale, pad_left, pad_top
+    resized = cv2.resize(image, (size, size), interpolation=interpolation)
+    return resized, scale, 0, 0
 
 
 def build_yolo_bbox_line(
