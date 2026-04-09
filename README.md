@@ -188,7 +188,3 @@ ROI and label structure examples:
 ![ROI Folder Labels](assets/screenshot/ROI-FolderLabels.png)
 
 ![YOLO ROI](assets/screenshot/YoloROI.png)
-
-## Add More Demo Images
-
-You can add more screenshots under assets/screenshot and reference them in this README.
