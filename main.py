@@ -1078,6 +1078,11 @@ class MainWindow(QMainWindow):
         act_invert_colors.triggered.connect(self._on_invert_colors)
         tool_menu.addAction(act_invert_colors)
 
+        # Diversify
+        act_diversify = QAction("Diversify Data (Augment)", self)
+        act_diversify.triggered.connect(self._on_diversify_data)
+        tool_menu.addAction(act_diversify)
+
     def _connect_signals(self):
         self.findChild(QPushButton, "btnOpenFolder").clicked.connect(
             self._on_open_folder
@@ -1573,6 +1578,129 @@ class MainWindow(QMainWindow):
         if label_char.upper() == UNREADABLE_LABEL_CHAR:
             return UNREADABLE_FOLDER_NAME
         return label_char
+    def _on_diversify_data(self):
+        input_parent = QFileDialog.getExistingDirectory(
+            self, "Select Source Folder (0-9 / Unreadable)"
+        )
+        if not input_parent:
+            return
+
+        valid, message, category_folders = self._validate_digit_category_parent(input_parent)
+        if not valid:
+            QMessageBox.warning(self, "Invalid Input Folder", message)
+            return
+
+        output_parent = QFileDialog.getExistingDirectory(self, "Select Output Folder for Augmented Data")
+        if not output_parent:
+            return
+
+        # Ask user how many variations they want per image
+        num_variants, ok = QInputDialog.getInt(
+            self, "Augmentation Density", 
+            "How many augmented versions to create per image?", 2, 1, 10
+        )
+        if not ok:
+            return
+
+        self._statusbar.showMessage("Diversifying dataset... please wait.")
+        processed, errors = self._diversify_category_images(
+            input_parent, output_parent, category_folders, num_variants
+        )
+
+        QMessageBox.information(
+            self, "Diversification Complete",
+            f"Finished generating {processed} new images.\nErrors encountered: {errors}"
+        )
+        self._statusbar.showMessage(f"Generated {processed} augmented images.")
+
+    def _diversify_category_images(self, input_parent, output_parent, categories, variants):
+        processed_count = 0
+        error_count = 0
+
+        for cat in categories:
+            src_dir = Path(input_parent) / cat
+            dst_dir = Path(output_parent) / cat
+            dst_dir.mkdir(parents=True, exist_ok=True)
+
+            for entry in src_dir.iterdir():
+                if not entry.is_file() or entry.suffix.lower() not in IMAGE_EXTENSIONS:
+                    continue
+
+                img = read_image_any(str(entry), cv2.IMREAD_GRAYSCALE)
+                if img is None:
+                    continue
+
+                for v in range(variants):
+                    augmented = self._apply_augmentation_pipeline(img)
+                    new_name = f"aug_{v}_{uuid.uuid4().hex[:6]}_{entry.name}"
+                    save_path = dst_dir / new_name
+                    
+                    if cv2.imwrite(str(save_path), augmented):
+                        processed_count += 1
+                    else:
+                        error_count += 1
+        
+        return processed_count, error_count
+
+    def _apply_augmentation_pipeline(self, img: np.ndarray) -> np.ndarray:
+        """Applies 3D perspective warping and smart thresholding."""
+        aug = img.copy()
+        h, w = aug.shape[:2]
+        
+        # 1. Perspective 'Perspective Squeeze' (3D Tilt)
+        # We define source points (the 28x28 square)
+        
+        # Choose a squeeze amount (2 to 5 pixels)
+        # Squeezing more than 6-7 pixels on a 28px canvas usually ruins legibility
+        squeeze = np.random.randint(2, 6)
+        side = np.random.choice(['left', 'right', 'none'], p=[0.2, 0.2, 0.6])
+        src_pts = np.float32([[0, 0], [w-1, 0], [w-1, h-1], [0, h-1]])
+        dst_pts = src_pts.copy()
+        if side == 'right':
+            # Squeeze the right edge inward (top down, bottom up)
+            dst_pts[1] = [w-1, squeeze]        # TR moves down
+            dst_pts[2] = [w-1, h-1-squeeze]    # BR moves up
+        elif side == 'left':
+            # Squeeze the left edge inward
+            dst_pts[0] = [0, squeeze]          # TL moves down
+            dst_pts[3] = [0, h-1-squeeze]      # BL moves up
+
+        M_persp = cv2.getPerspectiveTransform(src_pts, dst_pts)
+        aug = cv2.warpPerspective(aug, M_persp, (w, h), borderMode=cv2.BORDER_REPLICATE)
+
+        # 2. Subtle Rotation & Translation 
+        # (Reduced ranges because perspective already adds 'tilt')
+        angle = np.random.uniform(-2, 2)
+        M_rot = cv2.getRotationMatrix2D((w/2, h/2), angle, 1.0)
+        aug = cv2.warpAffine(aug, M_rot, (w, h), borderMode=cv2.BORDER_REPLICATE)
+
+        # 3. Smart Thresholding (Otsu's Method)
+        blur = cv2.GaussianBlur(aug, (3, 3), 0)
+        optimal_thresh, _ = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        
+        # Nudge the threshold to vary thickness
+        nudge = np.random.randint(-10, 10)
+        smart_thresh_val = np.clip(optimal_thresh + nudge, 10, 245)
+        _, aug = cv2.threshold(aug, smart_thresh_val, 255, cv2.THRESH_BINARY)
+
+        # 4. White Oblivion Safeguard
+        non_zero = cv2.countNonZero(aug)
+        coverage = non_zero / (h * w)
+        if coverage < 0.05 or coverage > 0.95:
+            # Revert to a clean adaptive threshold if perspective + Otsu killed the image
+            aug = cv2.adaptiveThreshold(
+                img, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                cv2.THRESH_BINARY, 11, 2
+            )
+
+        # 5. Fine-Grained Noise
+        # Instead of large dots, we use a very light 'salt and pepper' 
+        # that only affects the dark pixels.
+        noise = np.random.randint(-12, 13, (h, w), dtype='int16')
+        aug_noise = np.clip(aug.astype('int16') + noise, 0, 255).astype('uint8')
+        aug = np.where(aug < 255, aug_noise, 255)
+
+        return aug
 
     def _on_invert_colors(self):
         input_parent = QFileDialog.getExistingDirectory(
