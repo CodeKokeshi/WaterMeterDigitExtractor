@@ -15,6 +15,16 @@ from PyQt6.QtCore import *
 from PyQt6.QtGui import *
 from PyQt6.QtWidgets import *
 
+from digit_ml_commands import (
+    MlCommandWorker as ExternalMlCommandWorker,
+    build_lenet_predict_command,
+    build_lenet_train_command,
+    get_python_version,
+    is_supported_tensorflow_backend,
+    write_temp_strip_image,
+)
+from digit_ml_dialogs import LeNetTrainingDialog as ExternalLeNetTrainingDialog
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -36,6 +46,11 @@ ROI_640_LABELS_DIR_NAME = "ROI_640_labels"
 ROI_SIZE = 640
 ROI_YOLO_CLASS_ID = 0
 ROI_CONTEXT_MARGIN_RATIO = 0.20
+LENET_MODEL_DIR_NAME = "trained_models"
+LENET_KERAS_FILENAME = "lenet5_digits.keras"
+LENET_TFLITE_FILENAME = "lenet5_digits.tflite"
+LENET_LABELS_FILENAME = "labels.json"
+LENET_METRICS_FILENAME = "metrics.json"
 IMAGE_EXTENSIONS = {
     '.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif', '.webp', '.heic', '.heif'
 }
@@ -317,6 +332,23 @@ def gray_segment_to_pixmap(
     disp_seg = cv2.resize(gray_segment, (width, height), interpolation=interpolation)
     qimg = QImage(disp_seg.data, width, height, width, QImage.Format.Format_Grayscale8)
     return QPixmap.fromImage(qimg.copy())
+
+
+def prepare_strip_image(image: np.ndarray) -> np.ndarray:
+    """Normalize a digit-strip image to the expected 140x28 grayscale layout."""
+    if image is None:
+        raise ValueError("Empty strip image.")
+
+    if len(image.shape) == 3:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = image.copy()
+
+    if gray.size == 0:
+        raise ValueError("Empty strip image.")
+
+    interpolation = cv2.INTER_AREA if gray.shape[1] >= FINAL_W else cv2.INTER_LINEAR
+    return cv2.resize(gray, (FINAL_W, FINAL_H), interpolation=interpolation)
 
 
 # ---------------------------------------------------------------------------
@@ -748,14 +780,23 @@ class PreviewWidget(QWidget):
             "background: #222; border: 1px solid #555; padding: 4px;"
         )
         self._strip_label.setMinimumHeight(56)
+        self._strip_label.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding
+        )
         layout.addWidget(self._strip_label)
 
         seg_box = QGroupBox("Segments (28×28)")
         seg_layout = QHBoxLayout(seg_box)
+        seg_layout.setSpacing(8)
         self._seg_labels: list[QLabel] = []
         for i in range(NUM_SEGMENTS):
             lbl = QLabel()
-            lbl.setFixedSize(56, 56)
+            lbl.setMinimumSize(56, 56)
+            lbl.setSizePolicy(
+                QSizePolicy.Policy.Expanding,
+                QSizePolicy.Policy.Expanding
+            )
             lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
             lbl.setStyleSheet("background: #1a1a1a; border: 1px solid #444;")
             seg_layout.addWidget(lbl)
@@ -768,16 +809,7 @@ class PreviewWidget(QWidget):
     def set_strip(self, strip: np.ndarray):
         self._strip_img = strip
         self._segments = split_strip_segments(strip)
-        # Show strip (scale up for visibility)
-        disp = cv2.resize(strip, (FINAL_W * 3, FINAL_H * 3),
-                          interpolation=cv2.INTER_NEAREST)
-        qimg = QImage(disp.data, disp.shape[1], disp.shape[0],
-                       disp.shape[1], QImage.Format.Format_Grayscale8)
-        self._strip_label.setPixmap(QPixmap.fromImage(qimg))
-
-        # Segment into 5 cells
-        for i, seg in enumerate(self._segments):
-            self._seg_labels[i].setPixmap(gray_segment_to_pixmap(seg, 56, 56))
+        self._refresh_preview_pixmaps()
 
     def get_segments(self) -> list[np.ndarray]:
         return self._segments
@@ -790,6 +822,106 @@ class PreviewWidget(QWidget):
         for lbl in self._seg_labels:
             lbl.setPixmap(QPixmap())
 
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self._strip_img is not None:
+            self._refresh_preview_pixmaps()
+
+    def _refresh_preview_pixmaps(self):
+        if self._strip_img is None:
+            return
+
+        strip_rect = self._strip_label.contentsRect()
+        strip_width = max(strip_rect.width(), FINAL_W * 2)
+        strip_height = max(strip_rect.height(), FINAL_H * 2)
+        self._strip_label.setText("")
+        self._strip_label.setPixmap(
+            gray_segment_to_pixmap(
+                self._strip_img,
+                strip_width,
+                strip_height,
+                interpolation=cv2.INTER_NEAREST,
+            )
+        )
+
+        for i, seg in enumerate(self._segments):
+            seg_rect = self._seg_labels[i].contentsRect()
+            seg_width = max(seg_rect.width(), 56)
+            seg_height = max(seg_rect.height(), 56)
+            self._seg_labels[i].setPixmap(
+                gray_segment_to_pixmap(seg, seg_width, seg_height)
+            )
+
+class BalanceDialog(QDialog):
+    """Smart dialog that analyzes the dataset before asking for a target."""
+    def __init__(self, category_counts: dict[str, int], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Adaptive Dataset Balancer")
+        self.setModal(True)
+        self.setMinimumWidth(400)
+
+        layout = QVBoxLayout(self)
+
+        # 1. Show current stats
+        layout.addWidget(QLabel("<b>Current Dataset Distribution:</b>"))
+        
+        stats_text = ""
+        total_images = sum(category_counts.values())
+        for cat, count in sorted(category_counts.items()):
+            stats_text += f"Digit '{cat}': {count} images\n"
+        
+        stats_label = QLabel(stats_text)
+        stats_label.setStyleSheet("font-family: monospace; color: #9fc5e8;")
+        layout.addWidget(stats_label)
+        layout.addWidget(QLabel(f"<i>Total Images: {total_images}</i>\n"))
+
+        # 2. Calculate Adaptive Recommendations
+        counts = list(category_counts.values())
+        if not counts:
+            self.reject()
+            return
+            
+        median_val = int(np.median(counts))
+        mean_val = int(np.mean(counts))
+        max_val = max(counts)
+        min_val = min(counts)
+
+        # Safe recommendation: The Median is usually the safest bet for imbalanced data
+        # It downsizes the massive outliers and safely augments the tiny ones.
+        recommended_target = median_val
+        if recommended_target < 100: 
+            recommended_target = 100 # Ensure we have at least *some* volume
+
+        info = QLabel(
+            f"<b>Adaptive Analysis:</b>\n"
+            f"• Largest class: {max_val}\n"
+            f"• Smallest class: {min_val}\n"
+            f"• Median size: {median_val}\n\n"
+            f"<i>Recommendation: {recommended_target}</i>\n"
+            f"(Warning: Inflating tiny classes by more than 20x can cause overfitting.)"
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        # 3. User Input
+        input_layout = QHBoxLayout()
+        input_layout.addWidget(QLabel("<b>Set Target Count per Class:</b>"))
+        self.spinbox = QSpinBox()
+        self.spinbox.setRange(10, 50000)
+        self.spinbox.setValue(recommended_target)
+        self.spinbox.setFixedWidth(100)
+        input_layout.addWidget(self.spinbox)
+        input_layout.addStretch()
+        layout.addLayout(input_layout)
+
+        # Buttons
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    def get_target(self) -> int:
+        return self.spinbox.value()
 
 class BatchLabelDialog(QDialog):
     """Modal for fast per-image label entry during batch processing."""
@@ -905,6 +1037,468 @@ class BatchLabelDialog(QDialog):
         return self._readjust_requested
 
 
+class MlCommandWorker(QThread):
+    """Run an external ML helper command without freezing the UI."""
+
+    finished = pyqtSignal(object)
+    error = pyqtSignal(str)
+
+    def __init__(self, command: list[str], cwd: str):
+        super().__init__()
+        self._command = command
+        self._cwd = cwd
+
+    def run(self):
+        try:
+            completed = subprocess.run(
+                self._command,
+                cwd=self._cwd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+            )
+        except Exception as exc:
+            self.error.emit(str(exc))
+            return
+
+        stdout = completed.stdout.strip()
+        stderr = completed.stderr.strip()
+
+        if completed.returncode != 0:
+            message = stderr or stdout or "Unknown ML backend error."
+            self.error.emit(message)
+            return
+
+        if not stdout:
+            self.finished.emit({})
+            return
+
+        try:
+            self.finished.emit(json.loads(stdout))
+        except json.JSONDecodeError:
+            self.error.emit(stdout)
+
+
+class LeNetTrainingDialog(QDialog):
+    """Collect parameters for LeNet-style digit training."""
+
+    def __init__(
+        self,
+        dataset_dir: str,
+        backend_python: str,
+        output_dir: str,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("Train LeNet-5 Digit Model")
+        self.setModal(True)
+        self.setMinimumWidth(700)
+
+        self._dataset_dir = dataset_dir
+        self._backend_python = backend_python
+        self._output_dir = output_dir
+
+        layout = QVBoxLayout(self)
+
+        intro = QLabel(
+            "Train a LeNet-style digit classifier from your 0-9 folders and export "
+            "both a Keras model and a TFLite model for Android use."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        note = QLabel(
+            "TensorFlow must run on a compatible Python backend. "
+            "This app can stay on Python 3.14, but the training backend usually needs "
+            "Python 3.10-3.13 with TensorFlow installed."
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #f0d27a;")
+        layout.addWidget(note)
+
+        form = QFormLayout()
+
+        dataset_row = QHBoxLayout()
+        self._dataset_edit = QLineEdit(self._dataset_dir)
+        dataset_btn = QPushButton("Browseâ€¦")
+        dataset_btn.clicked.connect(self._browse_dataset)
+        dataset_row.addWidget(self._dataset_edit)
+        dataset_row.addWidget(dataset_btn)
+        form.addRow("Dataset Folder:", self._wrap_layout(dataset_row))
+
+        output_row = QHBoxLayout()
+        self._output_edit = QLineEdit(self._output_dir)
+        output_btn = QPushButton("Browseâ€¦")
+        output_btn.clicked.connect(self._browse_output)
+        output_row.addWidget(self._output_edit)
+        output_row.addWidget(output_btn)
+        form.addRow("Model Output:", self._wrap_layout(output_row))
+
+        backend_row = QHBoxLayout()
+        self._backend_edit = QLineEdit(self._backend_python)
+        backend_btn = QPushButton("Browseâ€¦")
+        backend_btn.clicked.connect(self._browse_backend)
+        backend_row.addWidget(self._backend_edit)
+        backend_row.addWidget(backend_btn)
+        form.addRow("Backend Python:", self._wrap_layout(backend_row))
+
+        self._epochs_spin = QSpinBox()
+        self._epochs_spin.setRange(1, 500)
+        self._epochs_spin.setValue(20)
+        form.addRow("Epochs:", self._epochs_spin)
+
+        self._batch_size_spin = QSpinBox()
+        self._batch_size_spin.setRange(4, 512)
+        self._batch_size_spin.setValue(32)
+        form.addRow("Batch Size:", self._batch_size_spin)
+
+        self._validation_spin = QDoubleSpinBox()
+        self._validation_spin.setRange(0.05, 0.5)
+        self._validation_spin.setSingleStep(0.05)
+        self._validation_spin.setDecimals(2)
+        self._validation_spin.setValue(0.20)
+        form.addRow("Validation Split:", self._validation_spin)
+
+        self._seed_spin = QSpinBox()
+        self._seed_spin.setRange(0, 999999)
+        self._seed_spin.setValue(42)
+        form.addRow("Random Seed:", self._seed_spin)
+
+        layout.addLayout(form)
+
+        self._buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        self._buttons.accepted.connect(self._on_accept)
+        self._buttons.rejected.connect(self.reject)
+        layout.addWidget(self._buttons)
+
+    def _wrap_layout(self, row_layout: QHBoxLayout) -> QWidget:
+        widget = QWidget()
+        widget.setLayout(row_layout)
+        return widget
+
+    def _browse_dataset(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select 0-9 Dataset Folder")
+        if folder:
+            self._dataset_edit.setText(folder)
+
+    def _browse_output(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select Model Output Folder")
+        if folder:
+            self._output_edit.setText(folder)
+
+    def _browse_backend(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Compatible Python Executable",
+            self._backend_edit.text().strip() or "",
+            "Python (*.exe);;All Files (*)",
+        )
+        if path:
+            self._backend_edit.setText(path)
+
+    def _on_accept(self):
+        dataset_dir = self._dataset_edit.text().strip()
+        output_dir = self._output_edit.text().strip()
+        backend_python = self._backend_edit.text().strip()
+
+        if not dataset_dir or not Path(dataset_dir).is_dir():
+            QMessageBox.warning(self, "Missing Dataset", "Select a valid dataset folder.")
+            return
+
+        if not output_dir:
+            QMessageBox.warning(self, "Missing Output", "Select an output folder.")
+            return
+
+        if not backend_python or not Path(backend_python).exists():
+            QMessageBox.warning(
+                self,
+                "Missing Backend Python",
+                "Select a compatible Python executable for TensorFlow training.",
+            )
+            return
+
+        version = get_python_version(backend_python)
+        if version is None:
+            QMessageBox.warning(
+                self,
+                "Unreadable Python",
+                "The selected Python executable could not be queried.",
+            )
+            return
+        if version < (3, 10) or version > (3, 13):
+            QMessageBox.warning(
+                self,
+                "Unsupported Python Version",
+                "TensorFlow training backend should use Python 3.10 to 3.13.\n\n"
+                f"Selected version: {version[0]}.{version[1]}",
+            )
+            return
+
+        self.accept()
+
+    def get_config(self) -> dict[str, object]:
+        return {
+            "dataset_dir": self._dataset_edit.text().strip(),
+            "output_dir": self._output_edit.text().strip(),
+            "backend_python": self._backend_edit.text().strip(),
+            "epochs": int(self._epochs_spin.value()),
+            "batch_size": int(self._batch_size_spin.value()),
+            "validation_split": float(self._validation_spin.value()),
+            "seed": int(self._seed_spin.value()),
+        }
+
+
+class LeNetTestingDialog(QDialog):
+    """Run a trained LeNet/TFLite model against a 5-digit strip image."""
+
+    run_requested = pyqtSignal(dict)
+
+    def __init__(self, backend_python: str, model_path: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Test LeNet-5 Digit Model")
+        self.setModal(True)
+        self.setMinimumWidth(860)
+
+        self._current_strip: np.ndarray | None = None
+        self._current_segments: list[np.ndarray] = []
+
+        layout = QVBoxLayout(self)
+
+        intro = QLabel(
+            "Load a cropped number-strip image, optionally type the expected 5-digit label, "
+            "then run the trained model through the same 5-slot segmentation used by this app."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        form = QFormLayout()
+
+        backend_row = QHBoxLayout()
+        self._backend_edit = QLineEdit(backend_python)
+        backend_btn = QPushButton("Browseâ€¦")
+        backend_btn.clicked.connect(self._browse_backend)
+        backend_row.addWidget(self._backend_edit)
+        backend_row.addWidget(backend_btn)
+        form.addRow("Backend Python:", self._wrap_layout(backend_row))
+
+        model_row = QHBoxLayout()
+        self._model_edit = QLineEdit(model_path)
+        model_btn = QPushButton("Browseâ€¦")
+        model_btn.clicked.connect(self._browse_model)
+        model_row.addWidget(self._model_edit)
+        model_row.addWidget(model_btn)
+        form.addRow("Model File:", self._wrap_layout(model_row))
+
+        image_row = QHBoxLayout()
+        self._image_edit = QLineEdit("")
+        image_btn = QPushButton("Browseâ€¦")
+        image_btn.clicked.connect(self._browse_image)
+        image_row.addWidget(self._image_edit)
+        image_row.addWidget(image_btn)
+        form.addRow("Strip Image:", self._wrap_layout(image_row))
+
+        self._expected_edit = QLineEdit()
+        self._expected_edit.setMaxLength(NUM_SEGMENTS)
+        self._expected_edit.setPlaceholderText("Optional expected label, e.g. 38104")
+        form.addRow("Expected Label:", self._expected_edit)
+
+        layout.addLayout(form)
+
+        preview_box = QGroupBox("Input Preview")
+        preview_layout = QVBoxLayout(preview_box)
+        self._strip_label = QLabel("No strip loaded")
+        self._strip_label.setMinimumHeight(90)
+        self._strip_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._strip_label.setStyleSheet("background: #111; border: 1px solid #444;")
+        preview_layout.addWidget(self._strip_label)
+
+        segments_row = QHBoxLayout()
+        self._segment_boxes: list[QGroupBox] = []
+        self._segment_labels: list[QLabel] = []
+        for _ in range(NUM_SEGMENTS):
+            box = QGroupBox("?")
+            box_layout = QVBoxLayout(box)
+            seg_label = QLabel()
+            seg_label.setMinimumSize(78, 78)
+            seg_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            seg_label.setStyleSheet("background: #111; border: 1px solid #444;")
+            box_layout.addWidget(seg_label)
+            self._segment_boxes.append(box)
+            self._segment_labels.append(seg_label)
+            segments_row.addWidget(box)
+        preview_layout.addLayout(segments_row)
+        layout.addWidget(preview_box)
+
+        self._result_label = QLabel("Run a test to see predictions.")
+        self._result_label.setWordWrap(True)
+        layout.addWidget(self._result_label)
+
+        buttons_row = QHBoxLayout()
+        self._run_btn = QPushButton("Run Test")
+        self._run_btn.clicked.connect(self._on_run_clicked)
+        buttons_row.addWidget(self._run_btn)
+        buttons_row.addStretch()
+        cancel_btn = QPushButton("Close")
+        cancel_btn.clicked.connect(self.reject)
+        buttons_row.addWidget(cancel_btn)
+        layout.addLayout(buttons_row)
+
+    def _wrap_layout(self, row_layout: QHBoxLayout) -> QWidget:
+        widget = QWidget()
+        widget.setLayout(row_layout)
+        return widget
+
+    def _browse_backend(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Compatible Python Executable",
+            self._backend_edit.text().strip() or "",
+            "Python (*.exe);;All Files (*)",
+        )
+        if path:
+            self._backend_edit.setText(path)
+
+    def _browse_model(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Trained Model",
+            self._model_edit.text().strip() or "",
+            "Models (*.tflite *.keras);;All Files (*)",
+        )
+        if path:
+            self._model_edit.setText(path)
+
+    def _browse_image(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Cropped Number Strip",
+            self._image_edit.text().strip() or "",
+            "Images (*.png *.jpg *.jpeg *.bmp *.tiff *.tif *.webp *.heic *.heif);;All Files (*)",
+        )
+        if not path:
+            return
+
+        self._image_edit.setText(path)
+        image = read_image_any(path, cv2.IMREAD_GRAYSCALE)
+        if image is None:
+            QMessageBox.warning(self, "Load Error", f"Cannot read:\n{path}")
+            return
+
+        try:
+            self._current_strip = prepare_strip_image(image)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Invalid Strip", str(exc))
+            return
+
+        self._current_segments = split_strip_segments(self._current_strip)
+        self._strip_label.setText("")
+        self._strip_label.setPixmap(
+            gray_segment_to_pixmap(
+                self._current_strip,
+                max(self._strip_label.width() - 12, FINAL_W * 3),
+                max(self._strip_label.height() - 12, FINAL_H * 3),
+                interpolation=cv2.INTER_NEAREST,
+            )
+        )
+
+        for i, seg in enumerate(self._current_segments):
+            self._segment_boxes[i].setTitle(f"Digit {i + 1}")
+            self._segment_labels[i].setPixmap(gray_segment_to_pixmap(seg, 84, 84))
+
+        self._result_label.setText("Strip loaded. Click Run Test to predict the 5 digits.")
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self._current_strip is not None:
+            self._strip_label.setPixmap(
+                gray_segment_to_pixmap(
+                    self._current_strip,
+                    max(self._strip_label.width() - 12, FINAL_W * 3),
+                    max(self._strip_label.height() - 12, FINAL_H * 3),
+                    interpolation=cv2.INTER_NEAREST,
+                )
+            )
+
+    def _on_run_clicked(self):
+        backend_python = self._backend_edit.text().strip()
+        model_path = self._model_edit.text().strip()
+        image_path = self._image_edit.text().strip()
+        expected = self._expected_edit.text().strip()
+
+        if not backend_python or not Path(backend_python).exists():
+            QMessageBox.warning(
+                self,
+                "Missing Backend Python",
+                "Select a compatible Python executable for model inference.",
+            )
+            return
+
+        version = get_python_version(backend_python)
+        if version is None:
+            QMessageBox.warning(
+                self,
+                "Unreadable Python",
+                "The selected Python executable could not be queried.",
+            )
+            return
+        if version < (3, 10) or version > (3, 13):
+            QMessageBox.warning(
+                self,
+                "Unsupported Python Version",
+                "TensorFlow inference backend should use Python 3.10 to 3.13.\n\n"
+                f"Selected version: {version[0]}.{version[1]}",
+            )
+            return
+
+        if not model_path or not Path(model_path).is_file():
+            QMessageBox.warning(self, "Missing Model", "Select a trained .tflite or .keras model.")
+            return
+
+        if not image_path or not Path(image_path).is_file():
+            QMessageBox.warning(self, "Missing Image", "Select a cropped strip image to test.")
+            return
+
+        if expected and (len(expected) != NUM_SEGMENTS or not expected.isdigit()):
+            QMessageBox.warning(
+                self,
+                "Invalid Expected Label",
+                f"Expected label must be exactly {NUM_SEGMENTS} digits if provided.",
+            )
+            return
+
+        self.run_requested.emit({
+            "backend_python": self._backend_edit.text().strip(),
+            "model_path": self._model_edit.text().strip(),
+            "image_path": self._image_edit.text().strip(),
+            "expected_label": self._expected_edit.text().strip(),
+        })
+
+    def set_busy(self, busy: bool):
+        self._run_btn.setEnabled(not busy)
+        self._result_label.setText("Running predictionâ€¦" if busy else self._result_label.text())
+
+    def apply_result(self, result: dict[str, object]):
+        predicted_label = str(result.get("predicted_label", ""))
+        expected_label = str(result.get("expected_label", ""))
+        confidences = result.get("confidences", [])
+        self._run_btn.setEnabled(True)
+
+        for i, score in enumerate(confidences[:NUM_SEGMENTS]):
+            confidence_pct = float(score) * 100.0
+            title = f"{predicted_label[i]} ({confidence_pct:.1f}%)" if i < len(predicted_label) else f"? ({confidence_pct:.1f}%)"
+            self._segment_boxes[i].setTitle(title)
+
+        if expected_label:
+            match_text = "MATCH" if expected_label == predicted_label else "MISMATCH"
+            self._result_label.setText(
+                f"Prediction: {predicted_label} | Expected: {expected_label} | Result: {match_text}"
+            )
+        else:
+            self._result_label.setText(f"Prediction: {predicted_label}")
+
+
 # ---------------------------------------------------------------------------
 # Main Window
 # ---------------------------------------------------------------------------
@@ -915,6 +1509,15 @@ class MainWindow(QMainWindow):
         self.resize(1280, 800)
         self._output_dir = ""
         self._worker: WarpWorker | None = None
+        self._ml_worker: ExternalMlCommandWorker | None = None
+        self._ml_progress: QProgressDialog | None = None
+        self._ml_backend_python = sys.executable
+        self._last_trained_model_dir = str(Path.cwd() / LENET_MODEL_DIR_NAME)
+        self._last_tflite_model_dir = self._last_trained_model_dir
+        self._last_trained_model_path = ""
+        self._testing_model_path = ""
+        self._testing_mode_enabled = False
+        self._testing_temp_image_path = ""
         self._pending_readjust_rotation: int | None = None
         self._pending_readjust_points_normalized: np.ndarray | None = None
         self._pending_readjust_zoom_factor: float | None = None
@@ -928,10 +1531,18 @@ class MainWindow(QMainWindow):
     def _build_ui(self):
         # Central splitter
         splitter = QSplitter(Qt.Orientation.Horizontal, self)
+        splitter.setChildrenCollapsible(False)
+        splitter.setHandleWidth(8)
         self.setCentralWidget(splitter)
+        self._main_splitter = splitter
 
         # --- Left: file list sidebar ---
         sidebar = QWidget()
+        sidebar.setMinimumWidth(180)
+        sidebar.setSizePolicy(
+            QSizePolicy.Policy.Preferred,
+            QSizePolicy.Policy.Expanding
+        )
         sb_layout = QVBoxLayout(sidebar)
         sb_layout.setContentsMargins(4, 4, 4, 4)
 
@@ -941,6 +1552,10 @@ class MainWindow(QMainWindow):
 
         self._file_list = QListWidget()
         self._file_list.setMinimumWidth(180)
+        self._file_list.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding
+        )
         sb_layout.addWidget(self._file_list)
         splitter.addWidget(sidebar)
 
@@ -954,38 +1569,44 @@ class MainWindow(QMainWindow):
 
         # Bottom controls
         ctrl = QWidget()
-        ctrl_layout = QHBoxLayout(ctrl)
+        ctrl_layout = QGridLayout(ctrl)
         ctrl_layout.setContentsMargins(6, 2, 6, 2)
+        ctrl_layout.setHorizontalSpacing(8)
+        ctrl_layout.setVerticalSpacing(6)
 
         self._btn_select = QPushButton("Select 4 Points")
         self._btn_select.setEnabled(False)
-        ctrl_layout.addWidget(self._btn_select)
+        ctrl_layout.addWidget(self._btn_select, 0, 0)
 
         self._btn_extract = QPushButton("Extract && Preview")
         self._btn_extract.setEnabled(False)
-        ctrl_layout.addWidget(self._btn_extract)
+        ctrl_layout.addWidget(self._btn_extract, 0, 1)
 
         self._label_entry = QLineEdit()
         self._label_entry.setPlaceholderText("5-char label (e.g. 011X9, X=Unreadable)")
         self._label_entry.setMaxLength(5)
-        self._label_entry.setFixedWidth(160)
-        ctrl_layout.addWidget(self._label_entry)
+        self._label_entry.setMinimumWidth(160)
+        self._label_entry.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed
+        )
+        ctrl_layout.addWidget(self._label_entry, 0, 2)
 
         self._batch_checkbox = QCheckBox("Batch Processing")
         self._batch_checkbox.setToolTip(
             "Apply current rotation and 4-point selection to all images in this folder."
         )
-        ctrl_layout.addWidget(self._batch_checkbox)
+        ctrl_layout.addWidget(self._batch_checkbox, 0, 3)
 
         self._btn_save = QPushButton("Save Segments")
         self._btn_save.setEnabled(False)
-        ctrl_layout.addWidget(self._btn_save)
+        ctrl_layout.addWidget(self._btn_save, 0, 4)
 
         self._btn_output = QPushButton("Set Output Dir…")
-        ctrl_layout.addWidget(self._btn_output)
+        ctrl_layout.addWidget(self._btn_output, 0, 5)
 
         self._rotation_label = QLabel("Rotate:")
-        ctrl_layout.addWidget(self._rotation_label)
+        ctrl_layout.addWidget(self._rotation_label, 1, 0)
 
         self._rotation_slider = QSlider(Qt.Orientation.Horizontal)
         self._rotation_slider.setRange(0, 359)
@@ -994,18 +1615,29 @@ class MainWindow(QMainWindow):
         self._rotation_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
         self._rotation_slider.setTickInterval(30)
         self._rotation_slider.setEnabled(False)
-        self._rotation_slider.setFixedWidth(220)
+        self._rotation_slider.setMinimumWidth(180)
+        self._rotation_slider.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed
+        )
         self._rotation_slider.setToolTip("Rotate image (0°-359°)")
-        ctrl_layout.addWidget(self._rotation_slider)
+        ctrl_layout.addWidget(self._rotation_slider, 1, 1, 1, 4)
 
         self._rotation_value = QLabel("0°")
         self._rotation_value.setFixedWidth(40)
-        ctrl_layout.addWidget(self._rotation_value)
-
-        ctrl_layout.addStretch()
+        ctrl_layout.addWidget(self._rotation_value, 1, 5)
 
         self._status_info = QLabel("")
-        ctrl_layout.addWidget(self._status_info)
+        self._status_info.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Preferred
+        )
+        self._status_info.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        ctrl_layout.addWidget(self._status_info, 1, 6)
+        ctrl_layout.setColumnStretch(2, 1)
+        ctrl_layout.setColumnStretch(6, 2)
 
         c_layout.addWidget(ctrl)
 
@@ -1013,9 +1645,15 @@ class MainWindow(QMainWindow):
         self._preview = PreviewWidget()
         c_layout.addWidget(self._preview, stretch=1)
 
+        self._prediction_label = QLabel("")
+        self._prediction_label.setWordWrap(True)
+        self._prediction_label.setStyleSheet("color: #9fc5e8; padding: 4px 8px;")
+        c_layout.addWidget(self._prediction_label)
+
         splitter.addWidget(centre)
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 5)
+        splitter.setSizes([260, 1020])
 
         # Status bar
         self._statusbar = QStatusBar()
@@ -1073,6 +1711,24 @@ class MainWindow(QMainWindow):
         act_fit.triggered.connect(self._viewer.fit_to_view)
         view_menu.addAction(act_fit)
 
+        training_menu = menu.addMenu("&Training")
+        act_train_lenet = QAction("Train LeNet-5 Digit Modelâ€¦", self)
+        act_train_lenet.triggered.connect(self._on_train_lenet)
+        training_menu.addAction(act_train_lenet)
+
+        testing_menu = menu.addMenu("&Testing")
+        act_test_lenet = QAction("Test LeNet-5 Digit Modelâ€¦", self)
+        act_test_lenet.triggered.connect(self._on_test_lenet)
+        testing_menu.addAction(act_test_lenet)
+        act_select_model = QAction("Select LeNet-5 Model...", self)
+        act_select_model.triggered.connect(self._on_select_test_model)
+        testing_menu.addAction(act_select_model)
+
+        self._act_testing_mode = QAction("Enable Viewer Testing Mode", self)
+        self._act_testing_mode.setCheckable(True)
+        self._act_testing_mode.toggled.connect(self._on_testing_mode_toggled)
+        testing_menu.addAction(self._act_testing_mode)
+
         tool_menu = menu.addMenu("&Tool")
         act_invert_colors = QAction("Invert Colors", self)
         act_invert_colors.triggered.connect(self._on_invert_colors)
@@ -1082,6 +1738,13 @@ class MainWindow(QMainWindow):
         act_diversify = QAction("Diversify Data (Augment)", self)
         act_diversify.triggered.connect(self._on_diversify_data)
         tool_menu.addAction(act_diversify)
+        
+        # --- NEW CODE TO ADD BELOW DIVERSIFY ---
+        # Balance Dataset
+        act_balance = QAction("Balance Dataset (Auto Up/Downsample)", self)
+        act_balance.triggered.connect(self._on_balance_dataset)
+        tool_menu.addAction(act_balance)
+        # --- END NEW CODE ---
 
     def _connect_signals(self):
         self.findChild(QPushButton, "btnOpenFolder").clicked.connect(
@@ -1096,7 +1759,432 @@ class MainWindow(QMainWindow):
         self._rotation_slider.valueChanged.connect(self._on_rotation_changed)
         self._viewer.points_ready.connect(self._on_points_ready)
 
+    def _start_ml_worker(
+        self,
+        command: list[str],
+        title: str,
+        status_message: str,
+        success_handler,
+    ):
+        if self._ml_worker is not None and self._ml_worker.isRunning():
+            QMessageBox.information(
+                self,
+                "ML Task Running",
+                "Please wait for the current training/testing task to finish first.",
+            )
+            return
+
+        progress = QProgressDialog(title, "", 0, 0, self)
+        progress.setWindowTitle(title)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setCancelButton(None)
+        progress.setMinimumDuration(0)
+        progress.show()
+
+        self._ml_progress = progress
+        self._ml_worker = ExternalMlCommandWorker(command, str(Path(__file__).resolve().parent))
+        self._ml_worker.finished.connect(success_handler)
+        self._ml_worker.error.connect(self._on_ml_worker_error)
+        self._ml_worker.finished.connect(self._cleanup_ml_worker)
+        self._ml_worker.error.connect(self._cleanup_ml_worker)
+        self._statusbar.showMessage(status_message)
+        self._ml_worker.start()
+
+    def _cleanup_ml_worker(self, *_args):
+        if self._ml_progress is not None:
+            self._ml_progress.close()
+            self._ml_progress = None
+        self._ml_worker = None
+
+    def _on_ml_worker_error(self, message: str):
+        self._statusbar.showMessage("ML task failed.")
+        QMessageBox.critical(self, "ML Task Failed", message)
+
     # -- Slots ---------------------------------------------------------------
+
+    def _on_train_lenet(self):
+        dataset_dir = QFileDialog.getExistingDirectory(
+            self,
+            "Select Digit Dataset Folder (must contain 0-9 folders)"
+        )
+        if not dataset_dir:
+            return
+
+        valid, message, category_folders = self._validate_digit_category_parent(dataset_dir)
+        if not valid:
+            QMessageBox.warning(self, "Invalid Dataset Folder", message)
+            return
+
+        digit_folders = {str(i) for i in range(10)}
+        missing_digits = sorted(digit_folders - set(category_folders), key=int)
+        if missing_digits:
+            QMessageBox.warning(
+                self,
+                "Incomplete Dataset",
+                "Training requires folders 0 through 9.\n\n"
+                f"Missing folder(s): {', '.join(missing_digits)}"
+            )
+            return
+
+        keras_output_dir = self._last_trained_model_dir or str(Path.cwd() / LENET_MODEL_DIR_NAME)
+        tflite_output_dir = self._last_tflite_model_dir or keras_output_dir
+        dialog = ExternalLeNetTrainingDialog(
+            dataset_dir=dataset_dir,
+            backend_python=self._ml_backend_python,
+            keras_output_dir=keras_output_dir,
+            tflite_output_dir=tflite_output_dir,
+            parent=self,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        config = dialog.get_config()
+        self._ml_backend_python = str(config["backend_python"])
+        version = get_python_version(self._ml_backend_python)
+        if not is_supported_tensorflow_backend(version):
+            QMessageBox.warning(
+                self,
+                "Unsupported Python Version",
+                "TensorFlow training backend should use Python 3.10 to 3.13.\n\n"
+                f"Selected version: {version[0]}.{version[1]}" if version else
+                "The selected Python executable could not be queried.",
+            )
+            return
+        self._last_trained_model_dir = str(config["keras_output_dir"])
+        self._last_tflite_model_dir = str(config["tflite_output_dir"])
+
+        command = build_lenet_train_command(
+            backend_python=str(config["backend_python"]),
+            dataset_dir=str(config["dataset_dir"]),
+            keras_output_dir=str(config["keras_output_dir"]),
+            tflite_output_dir=str(config["tflite_output_dir"]),
+            epochs=int(config["epochs"]),
+            batch_size=int(config["batch_size"]),
+            validation_split=float(config["validation_split"]),
+            seed=int(config["seed"]),
+        )
+        self._start_ml_worker(
+            command,
+            "Training LeNet-5 Model",
+            "Training LeNet-5 digit modelâ€¦",
+            self._on_lenet_training_finished,
+        )
+
+    def _on_lenet_training_finished(self, result: dict[str, object]):
+        keras_path = str(result.get("keras_model_path", ""))
+        tflite_path = str(result.get("tflite_model_path", ""))
+        self._last_trained_model_path = tflite_path or keras_path
+        if tflite_path:
+            self._last_trained_model_dir = str(Path(tflite_path).parent)
+
+        train_acc = float(result.get("train_accuracy", 0.0)) * 100.0
+        val_acc = float(result.get("val_accuracy", 0.0)) * 100.0
+        test_acc = float(result.get("test_accuracy", 0.0)) * 100.0
+        dataset_size = int(result.get("dataset_size", 0))
+
+        self._statusbar.showMessage(
+            f"LeNet training complete. Test accuracy: {test_acc:.2f}%"
+        )
+        QMessageBox.information(
+            self,
+            "LeNet Training Complete",
+            f"Dataset size: {dataset_size}\n"
+            f"Train accuracy: {train_acc:.2f}%\n"
+            f"Validation accuracy: {val_acc:.2f}%\n"
+            f"Test accuracy: {test_acc:.2f}%\n\n"
+            f"Keras model: {keras_path or '(not saved)'}\n"
+            f"TFLite model: {tflite_path or '(not saved)'}"
+        )
+
+    def _on_test_lenet(self):
+        model_path = self._last_trained_model_path
+        if not model_path:
+            default_tflite = Path(self._last_trained_model_dir) / LENET_TFLITE_FILENAME
+            default_keras = Path(self._last_trained_model_dir) / LENET_KERAS_FILENAME
+            if default_tflite.exists():
+                model_path = str(default_tflite)
+            elif default_keras.exists():
+                model_path = str(default_keras)
+
+        dialog = LeNetTestingDialog(
+            backend_python=self._ml_backend_python,
+            model_path=model_path,
+            parent=self,
+        )
+        self._active_test_dialog = dialog
+        dialog.run_requested.connect(self._run_lenet_test)
+        dialog.exec()
+        self._active_test_dialog = None
+
+    def _run_lenet_test(self, config: dict[str, str]):
+        self._ml_backend_python = config["backend_python"]
+        self._last_trained_model_path = config["model_path"]
+
+        script_path = get_ml_backend_script_path()
+        if not script_path.exists():
+            QMessageBox.critical(
+                self,
+                "Missing Backend Script",
+                f"Cannot find testing backend script:\n{script_path}"
+            )
+            return
+
+        if self._active_test_dialog is not None:
+            self._active_test_dialog.set_busy(True)
+
+        command = [
+            config["backend_python"],
+            str(script_path),
+            "predict",
+            "--model-path", config["model_path"],
+            "--image-path", config["image_path"],
+        ]
+        if config["expected_label"]:
+            command.extend(["--expected-label", config["expected_label"]])
+
+        self._start_ml_worker(
+            command,
+            "Testing LeNet-5 Model",
+            "Running LeNet-5 prediction on the strip imageâ€¦",
+            self._on_lenet_test_finished,
+        )
+
+    def _on_lenet_test_finished(self, result: dict[str, object]):
+        self._statusbar.showMessage(
+            f"LeNet prediction: {result.get('predicted_label', '')}"
+        )
+        if self._active_test_dialog is not None:
+            self._active_test_dialog.apply_result(result)
+            self._active_test_dialog.raise_()
+            self._active_test_dialog.activateWindow()
+
+    def _on_train_lenet(self):
+        dataset_dir = QFileDialog.getExistingDirectory(
+            self,
+            "Select Digit Dataset Folder (must contain 0-9 folders)"
+        )
+        if not dataset_dir:
+            return
+
+        valid, message, category_folders = self._validate_digit_category_parent(dataset_dir)
+        if not valid:
+            QMessageBox.warning(self, "Invalid Dataset Folder", message)
+            return
+
+        digit_folders = {str(i) for i in range(10)}
+        missing_digits = sorted(digit_folders - set(category_folders), key=int)
+        if missing_digits:
+            QMessageBox.warning(
+                self,
+                "Incomplete Dataset",
+                "Training requires folders 0 through 9.\n\n"
+                f"Missing folder(s): {', '.join(missing_digits)}"
+            )
+            return
+
+        dialog = ExternalLeNetTrainingDialog(
+            dataset_dir=dataset_dir,
+            backend_python=self._ml_backend_python,
+            keras_output_dir=self._last_trained_model_dir,
+            tflite_output_dir=self._last_tflite_model_dir,
+            parent=self,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        config = dialog.get_config()
+        self._ml_backend_python = str(config["backend_python"])
+        version = get_python_version(self._ml_backend_python)
+        if not is_supported_tensorflow_backend(version):
+            selected_version = (
+                f"{version[0]}.{version[1]}" if version else "(could not detect version)"
+            )
+            QMessageBox.warning(
+                self,
+                "Unsupported Python Version",
+                "TensorFlow training backend should use Python 3.10 to 3.13.\n\n"
+                f"Selected version: {selected_version}",
+            )
+            return
+
+        self._last_trained_model_dir = str(config["keras_output_dir"])
+        self._last_tflite_model_dir = str(config["tflite_output_dir"])
+        command = build_lenet_train_command(
+            backend_python=str(config["backend_python"]),
+            dataset_dir=str(config["dataset_dir"]),
+            keras_output_dir=str(config["keras_output_dir"]),
+            tflite_output_dir=str(config["tflite_output_dir"]),
+            epochs=int(config["epochs"]),
+            batch_size=int(config["batch_size"]),
+            validation_split=float(config["validation_split"]),
+            seed=int(config["seed"]),
+        )
+        self._start_ml_worker(
+            command,
+            "Training LeNet-5 Model",
+            "Training LeNet-5 digit model...",
+            self._on_lenet_training_finished,
+        )
+
+    def _on_lenet_training_finished(self, result: dict[str, object]):
+        keras_path = str(result.get("keras_model_path", ""))
+        tflite_path = str(result.get("tflite_model_path", ""))
+        self._last_trained_model_path = tflite_path or keras_path
+        if keras_path:
+            self._last_trained_model_dir = str(Path(keras_path).parent)
+        if tflite_path:
+            self._last_tflite_model_dir = str(Path(tflite_path).parent)
+
+        train_acc = float(result.get("train_accuracy", 0.0)) * 100.0
+        val_acc = float(result.get("val_accuracy", 0.0)) * 100.0
+        test_acc = float(result.get("test_accuracy", 0.0)) * 100.0
+        dataset_size = int(result.get("dataset_size", 0))
+
+        self._prediction_label.setText(
+            "Training output saved.\n"
+            f"TensorFlow/Keras: {keras_path or '(not saved)'}\n"
+            f"TFLite: {tflite_path or '(not saved)'}"
+        )
+        self._statusbar.showMessage(
+            f"LeNet training complete. Test accuracy: {test_acc:.2f}%"
+        )
+        QMessageBox.information(
+            self,
+            "LeNet Training Complete",
+            f"Dataset size: {dataset_size}\n"
+            f"Train accuracy: {train_acc:.2f}%\n"
+            f"Validation accuracy: {val_acc:.2f}%\n"
+            f"Test accuracy: {test_acc:.2f}%\n\n"
+            f"TensorFlow/Keras model: {keras_path or '(not saved)'}\n"
+            f"TFLite model: {tflite_path or '(not saved)'}"
+        )
+
+    def _on_test_lenet(self):
+        self._on_select_test_model()
+
+    def _on_select_test_model(self):
+        start_dir = self._last_tflite_model_dir or self._last_trained_model_dir
+        model_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select LeNet-5 Model",
+            start_dir,
+            "Models (*.tflite *.keras);;All Files (*)",
+        )
+        if not model_path:
+            return
+
+        self._testing_model_path = model_path
+        self._last_trained_model_path = model_path
+        self._prediction_label.setText(
+            f"Selected testing model:\n{self._testing_model_path}"
+        )
+        self._statusbar.showMessage(f"Testing model selected: {Path(model_path).name}")
+        if hasattr(self, "_act_testing_mode") and not self._act_testing_mode.isChecked():
+            self._act_testing_mode.setChecked(True)
+        else:
+            self._update_testing_ui_state()
+
+    def _on_testing_mode_toggled(self, enabled: bool):
+        if enabled and not self._testing_model_path:
+            QMessageBox.information(
+                self,
+                "Select a Model First",
+                "Choose a LeNet model first, then enable viewer testing mode."
+            )
+            self._act_testing_mode.blockSignals(True)
+            self._act_testing_mode.setChecked(False)
+            self._act_testing_mode.blockSignals(False)
+            return
+
+        self._testing_mode_enabled = enabled
+        self._update_testing_ui_state()
+
+    def _update_testing_ui_state(self):
+        if self._testing_mode_enabled:
+            self._batch_checkbox.setChecked(False)
+            self._batch_checkbox.setEnabled(False)
+            self._btn_extract.setText("Extract && Predict")
+            self._btn_save.setEnabled(False)
+            self._label_entry.setPlaceholderText(
+                "Optional expected 5-digit label for comparison"
+            )
+            model_name = Path(self._testing_model_path).name if self._testing_model_path else "(none)"
+            self._status_info.setText(f"Testing Mode ON | Model: {model_name}")
+            self._statusbar.showMessage(
+                "Viewer testing mode enabled. Select 4 points, then click Extract."
+            )
+            return
+
+        self._batch_checkbox.setEnabled(True)
+        self._btn_extract.setText("Extract && Preview")
+        self._label_entry.setPlaceholderText("5-char label (e.g. 011X9, X=Unreadable)")
+        self._status_info.setText("")
+        self._prediction_label.setText("")
+        if self._file_list.count() > 0:
+            self._statusbar.showMessage("Testing mode disabled.")
+
+    def _run_viewer_test_on_strip(self, strip: np.ndarray):
+        if not self._testing_model_path:
+            QMessageBox.warning(
+                self,
+                "No Testing Model",
+                "Select a LeNet model before using viewer testing mode.",
+            )
+            return
+
+        version = get_python_version(self._ml_backend_python)
+        if not is_supported_tensorflow_backend(version):
+            selected_version = (
+                f"{version[0]}.{version[1]}" if version else "(could not detect version)"
+            )
+            QMessageBox.warning(
+                self,
+                "Unsupported Python Version",
+                "TensorFlow inference backend should use Python 3.10 to 3.13.\n\n"
+                f"Selected version: {selected_version}",
+            )
+            return
+
+        expected_label = self._label_entry.text().strip()
+        if expected_label and (len(expected_label) != NUM_SEGMENTS or not expected_label.isdigit()):
+            expected_label = ""
+
+        self._testing_temp_image_path = write_temp_strip_image(strip)
+        command = build_lenet_predict_command(
+            backend_python=self._ml_backend_python,
+            model_path=self._testing_model_path,
+            image_path=self._testing_temp_image_path,
+            expected_label=expected_label,
+        )
+        self._start_ml_worker(
+            command,
+            "Testing LeNet-5 Model",
+            "Running LeNet-5 prediction on the current 4-point selection...",
+            self._on_lenet_test_finished,
+        )
+
+    def _on_lenet_test_finished(self, result: dict[str, object]):
+        predicted_label = str(result.get("predicted_label", ""))
+        expected_label = str(result.get("expected_label", ""))
+        confidences = result.get("confidences", [])
+        confidence_summary = ", ".join(f"{float(score) * 100.0:.1f}%" for score in confidences)
+
+        if expected_label:
+            outcome = "MATCH" if expected_label == predicted_label else "MISMATCH"
+            self._prediction_label.setText(
+                f"Prediction: {predicted_label}\n"
+                f"Expected: {expected_label}\n"
+                f"Result: {outcome}\n"
+                f"Per-digit confidence: {confidence_summary}"
+            )
+        else:
+            self._prediction_label.setText(
+                f"Prediction: {predicted_label}\n"
+                f"Per-digit confidence: {confidence_summary}"
+            )
+
+        self._status_info.setText(f"Predicted: {predicted_label}")
+        self._statusbar.showMessage(f"LeNet prediction: {predicted_label}")
 
     def _on_open_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Image Folder")
@@ -1104,8 +2192,11 @@ class MainWindow(QMainWindow):
             return
         self._file_list.clear()
         files = sorted(
-            p for p in Path(folder).iterdir()
-            if p.suffix.lower() in IMAGE_EXTENSIONS
+            (
+                p for p in Path(folder).iterdir()
+                if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
+            ),
+            key=lambda p: (p.stat().st_mtime, p.name.lower())
         )
         if not files:
             QMessageBox.information(self, "No Images",
@@ -1133,6 +2224,7 @@ class MainWindow(QMainWindow):
         self._btn_extract.setEnabled(False)
         self._btn_save.setEnabled(False)
         self._preview.clear()
+        self._prediction_label.setText("")
         if self._apply_pending_readjust_template_if_any():
             self._statusbar.showMessage(
                 "Readjust template loaded. Drag points to adjust, then continue batch."
@@ -1218,6 +2310,11 @@ class MainWindow(QMainWindow):
 
     def _on_points_ready(self):
         self._btn_extract.setEnabled(True)
+        if self._testing_mode_enabled and self._testing_model_path:
+            self._statusbar.showMessage(
+                "4 points placed. Testing mode is enabled: click Extract to predict."
+            )
+            return
         if self._batch_checkbox.isChecked():
             self._btn_save.setEnabled(True)
             self._statusbar.showMessage(
@@ -1236,7 +2333,10 @@ class MainWindow(QMainWindow):
         if pts is None or img is None:
             return
         self._btn_extract.setEnabled(False)
-        self._statusbar.showMessage("Processing…")
+        if self._testing_mode_enabled and self._testing_model_path:
+            self._statusbar.showMessage("Processing selection and running model prediction...")
+        else:
+            self._statusbar.showMessage("Processing...")
         self._worker = WarpWorker(img, pts)
         self._worker.signals.finished.connect(self._on_warp_done)
         self._worker.signals.error.connect(self._on_warp_error)
@@ -1245,6 +2345,10 @@ class MainWindow(QMainWindow):
     def _on_warp_done(self, strip: np.ndarray):
         self._preview.set_strip(strip)
         self._btn_extract.setEnabled(True)
+        if self._testing_mode_enabled and self._testing_model_path:
+            self._btn_save.setEnabled(False)
+            self._run_viewer_test_on_strip(strip)
+            return
         self._btn_save.setEnabled(True)
         if self._batch_checkbox.isChecked():
             self._statusbar.showMessage(
@@ -1701,6 +2805,172 @@ class MainWindow(QMainWindow):
         aug = np.where(aug < 255, aug_noise, 255)
 
         return aug
+
+    def _on_balance_dataset(self):
+        input_parent = QFileDialog.getExistingDirectory(
+            self, "Select Imbalanced Source Folder (0-9 / Unreadable)"
+        )
+        if not input_parent:
+            return
+
+        valid, message, category_folders = self._validate_digit_category_parent(input_parent)
+        if not valid:
+            QMessageBox.warning(self, "Invalid Input Folder", message)
+            return
+
+        # PRE-SCAN: Count the images so the UI is smart
+        category_counts = {}
+        for cat in category_folders:
+            cat_path = Path(input_parent) / cat
+            count = len([p for p in cat_path.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS])
+            category_counts[cat] = count
+
+        # Open the Smart Dialog
+        dialog = BalanceDialog(category_counts, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+            
+        target_count = dialog.get_target()
+
+        output_parent = QFileDialog.getExistingDirectory(self, "Select Output Folder for Balanced Data")
+        if not output_parent:
+            return
+
+        self._statusbar.showMessage(f"Balancing dataset to {target_count} per class... This may take a moment.")
+        QApplication.processEvents() 
+
+        log_messages = self._balance_category_images(
+            input_parent, output_parent, category_folders, target_count
+        )
+
+        summary = "\n".join(log_messages)
+        QMessageBox.information(
+            self, "Balancing Complete",
+            f"Finished balancing dataset to {target_count} images per class.\n\nSummary:\n{summary}"
+        )
+        self._statusbar.showMessage("Dataset balancing complete.")
+
+    def _balance_category_images(self, input_parent, output_parent, categories, target_count):
+        log = []
+        for cat in categories:
+            src_dir = Path(input_parent) / cat
+            dst_dir = Path(output_parent) / cat
+            dst_dir.mkdir(parents=True, exist_ok=True)
+
+            # Gather all valid images in this category
+            image_paths = [
+                p for p in src_dir.iterdir() 
+                if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
+            ]
+            current_count = len(image_paths)
+
+            if current_count == 0:
+                log.append(f"Category '{cat}': Skipped (0 images)")
+                continue
+
+            if current_count == target_count:
+                # Perfect already, just copy them
+                self._copy_images(image_paths, dst_dir)
+                log.append(f"Category '{cat}': Copied {current_count} (Already balanced)")
+
+            elif current_count > target_count:
+                # DOWNSAMPLING (Too many images, e.g., '0's)
+                # Use smart deduplication to remove the most similar look-alikes
+                kept_paths = self._smart_downsample(image_paths, target_count)
+                self._copy_images(kept_paths, dst_dir)
+                log.append(f"Category '{cat}': Downsampled {current_count} -> {target_count} (Removed look-alikes)")
+
+            else:
+                # OVERSAMPLING (Too few images, e.g., '3's)
+                # Copy all originals first
+                self._copy_images(image_paths, dst_dir)
+                
+                # Generate new augmented ones to make up the difference
+                shortfall = target_count - current_count
+                self._generate_targeted_augmentations(image_paths, dst_dir, shortfall)
+                log.append(f"Category '{cat}': Oversampled {current_count} -> {target_count} (+{shortfall} augmented)")
+
+        return log
+
+    def _copy_images(self, paths, dst_dir):
+        """Helper to copy original images to the balanced folder."""
+        for p in paths:
+            img = read_image_any(str(p), cv2.IMREAD_UNCHANGED)
+            if img is not None:
+                cv2.imwrite(str(dst_dir / p.name), img)
+
+    def _generate_targeted_augmentations(self, base_paths, dst_dir, shortfall):
+        """Randomly picks base images and augments them until the shortfall is met."""
+        for i in range(shortfall):
+            # Randomly select a source image to augment
+            src_path = np.random.choice(base_paths)
+            img = read_image_any(str(src_path), cv2.IMREAD_GRAYSCALE)
+            
+            if img is not None:
+                augmented = self._apply_augmentation_pipeline(img)
+                new_name = f"bal_aug_{uuid.uuid4().hex[:6]}.png"
+                cv2.imwrite(str(dst_dir / new_name), augmented)
+
+    def _smart_downsample(self, image_paths, target_count):
+        """
+        Keeps images that are visually distinct.
+        For a 28x28 image, comparing raw pixels using Mean Squared Error (MSE)
+        is a very fast and effective way to find near-duplicates.
+        """
+        # Load all images into memory for fast comparison (they are tiny, so this is safe)
+        loaded_images = []
+        for p in image_paths:
+            img = read_image_any(str(p), cv2.IMREAD_GRAYSCALE)
+            if img is not None:
+                # Blur slightly to focus on structure rather than noise
+                blur = cv2.GaussianBlur(img, (3,3), 0)
+                loaded_images.append((p, blur.astype('float32')))
+
+        # Shuffle to ensure we don't just keep the first N images chronologically
+        np.random.shuffle(loaded_images)
+
+        kept = [loaded_images[0]] # Always keep the first one
+        
+        # We need to find `target_count` images.
+        # We check each candidate against our `kept` list. If it's too similar 
+        # (MSE is too low) to an already kept image, we discard it.
+        
+        # A dynamic threshold. We start strict, and loosen it if we are running out of images
+        mse_threshold = 800.0 
+
+        while len(kept) < target_count and mse_threshold >= 0:
+            for item in loaded_images:
+                if len(kept) >= target_count:
+                    break
+                if item in kept:
+                    continue
+                
+                path, img_data = item
+                
+                # Check MSE against all currently kept images
+                # If the minimum distance to ANY kept image is greater than threshold, it's unique enough
+                is_unique = True
+                for _, kept_data in kept:
+                    mse = np.mean((img_data - kept_data) ** 2)
+                    if mse < mse_threshold:
+                        is_unique = False
+                        break
+                
+                if is_unique:
+                    kept.append(item)
+            
+            # If we looped through all images and still need more, lower our standards (accept more similar images)
+            mse_threshold -= 100.0
+
+        # If we STILL don't have enough (very rare, means images are literal perfect clones),
+        # just randomly sample the rest.
+        if len(kept) < target_count:
+            remaining = [i for i in loaded_images if i not in kept]
+            np.random.shuffle(remaining)
+            needed = target_count - len(kept)
+            kept.extend(remaining[:needed])
+
+        return [item[0] for item in kept]
 
     def _on_invert_colors(self):
         input_parent = QFileDialog.getExistingDirectory(
