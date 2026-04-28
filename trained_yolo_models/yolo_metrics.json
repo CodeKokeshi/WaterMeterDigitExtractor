@@ -1,0 +1,8 @@
+{
+  "train_images": 1308,
+  "val_images": 327,
+  "total_images": 1635,
+  "best_model_path": "D:\\OS2025Dev\\DigitExtractor\\trained_yolo_models\\yolov8_digit_strip\\weights\\best.pt",
+  "tflite_model_path": "",
+  "export_warning": "module 'tensorflow._api.v2.compat.v2.__internal__' has no attribute 'register_load_context_function'"
+}

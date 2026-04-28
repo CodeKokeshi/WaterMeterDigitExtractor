@@ -1,0 +1,24 @@
+{
+  "dataset_size": 3780,
+  "class_counts": {
+    "0": 378,
+    "1": 378,
+    "2": 378,
+    "3": 378,
+    "4": 378,
+    "5": 378,
+    "6": 378,
+    "7": 378,
+    "8": 378,
+    "9": 378
+  },
+  "epochs": 20,
+  "batch_size": 32,
+  "train_accuracy": 0.9917218685150146,
+  "val_accuracy": 0.9263157844543457,
+  "test_accuracy": 0.9263157844543457,
+  "test_loss": 0.2723347842693329,
+  "keras_model_path": "D:\\OS2025Dev\\DigitExtractor\\trained_models\\lenet5_digits.keras",
+  "tflite_model_path": "D:\\OS2025Dev\\DigitExtractor\\trained_models\\lenet5_digits.tflite",
+  "labels_path": "D:\\OS2025Dev\\DigitExtractor\\trained_models\\labels.json"
+}

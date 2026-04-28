@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import cv2
@@ -17,6 +18,10 @@ FINAL_H = 28
 IMAGE_EXTENSIONS = {
     ".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".webp", ".heic", ".heif"
 }
+
+
+def log(message: str):
+    print(message, flush=True)
 
 
 def split_strip_segments(strip: np.ndarray) -> list[np.ndarray]:
@@ -45,6 +50,13 @@ def prepare_strip_image(path: str) -> tuple[np.ndarray, list[np.ndarray]]:
     image = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
     if image is None:
         raise ValueError(f"Cannot read strip image: {path}")
+
+    return prepare_strip_array(image)
+
+
+def prepare_strip_array(image: np.ndarray) -> tuple[np.ndarray, list[np.ndarray]]:
+    if image is None or image.size == 0:
+        raise ValueError("Cannot read strip image.")
 
     interpolation = cv2.INTER_AREA if image.shape[1] >= FINAL_W else cv2.INTER_LINEAR
     strip = cv2.resize(image, (FINAL_W, FINAL_H), interpolation=interpolation)
@@ -153,11 +165,16 @@ def command_train(args: argparse.Namespace):
     tflite_output_dir.mkdir(parents=True, exist_ok=True)
 
     x, y, counts = load_digit_dataset(dataset_dir)
+    log(f"[LeNet] Loaded dataset with {len(x)} images.")
     x_train, y_train, x_val, y_val = stratified_split(
         x,
         y,
         validation_split=args.validation_split,
         seed=args.seed,
+    )
+    log(
+        f"[LeNet] Train/val split ready. Train={len(x_train)} images, "
+        f"Val={len(x_val)} images, Epochs={args.epochs}, Batch={args.batch_size}."
     )
 
     tf.keras.utils.set_random_seed(args.seed)
@@ -169,6 +186,18 @@ def command_train(args: argparse.Namespace):
         metrics=["accuracy"],
     )
 
+    class EpochLogger(tf.keras.callbacks.Callback):
+        def on_epoch_end(self, epoch, logs=None):
+            logs = logs or {}
+            log(
+                "[LeNet] "
+                f"Epoch {epoch + 1}/{args.epochs} "
+                f"loss={float(logs.get('loss', 0.0)):.4f} "
+                f"acc={float(logs.get('accuracy', 0.0)):.4f} "
+                f"val_loss={float(logs.get('val_loss', 0.0)):.4f} "
+                f"val_acc={float(logs.get('val_accuracy', 0.0)):.4f}"
+            )
+
     history = model.fit(
         x_train,
         y_train,
@@ -176,9 +205,11 @@ def command_train(args: argparse.Namespace):
         epochs=args.epochs,
         batch_size=args.batch_size,
         verbose=0,
+        callbacks=[EpochLogger()],
     )
 
     test_loss, test_accuracy = model.evaluate(x_val, y_val, verbose=0)
+    log(f"[LeNet] Evaluation complete. test_loss={float(test_loss):.4f} test_acc={float(test_accuracy):.4f}")
 
     keras_path = keras_output_dir / "lenet5_digits.keras"
     model.save(keras_path)
@@ -207,6 +238,7 @@ def command_train(args: argparse.Namespace):
     metrics_path = tflite_output_dir / "metrics.json"
     metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
 
+    log("[LeNet] Training complete. Writing final metrics JSON.")
     print(json.dumps(metrics))
 
 
@@ -265,6 +297,9 @@ def command_predict(args: argparse.Namespace):
 
     model_path = Path(args.model_path)
     _strip, segments = prepare_strip_image(args.image_path)
+    log(f"[LeNet] Predicting 5-digit strip from {args.image_path}")
+    if args.invert_input:
+        segments = [cv2.bitwise_not(seg) for seg in segments]
     samples = np.asarray([prepare_digit_image(seg) for seg in segments], dtype=np.float32)[..., np.newaxis]
 
     if model_path.suffix.lower() == ".tflite":
@@ -281,7 +316,136 @@ def command_predict(args: argparse.Namespace):
         "expected_label": args.expected_label or "",
         "confidences": confidences,
     }
+    log(f"[LeNet] Prediction complete: {predicted_label}")
     print(json.dumps(result))
+
+
+def command_predict_batch(args: argparse.Namespace):
+    try:
+        import tensorflow as tf  # noqa: F401
+    except Exception as exc:
+        raise RuntimeError(
+            "TensorFlow is not available in the selected backend Python. "
+            "Use a Python 3.10-3.13 environment with TensorFlow installed."
+        ) from exc
+
+    model_path = Path(args.model_path)
+    images_dir = Path(args.images_dir)
+    image_paths = sorted(
+        p for p in images_dir.iterdir()
+        if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
+    )
+    if not image_paths:
+        raise ValueError("No strip candidate images were found.")
+    log(f"[LeNet] Predict-batch on {len(image_paths)} strip candidates from {images_dir}")
+
+    samples: list[np.ndarray] = []
+    sample_ranges: list[tuple[str, int, int]] = []
+    for image_path in image_paths:
+        image = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
+        strip, segments = prepare_strip_array(image)
+        if args.invert_input:
+            segments = [cv2.bitwise_not(seg) for seg in segments]
+        start = len(samples)
+        samples.extend(prepare_digit_image(seg) for seg in segments)
+        end = len(samples)
+        sample_ranges.append((image_path.stem, start, end))
+
+    sample_array = np.asarray(samples, dtype=np.float32)[..., np.newaxis]
+    if model_path.suffix.lower() == ".tflite":
+        probs = predict_with_tflite(model_path, sample_array)
+    else:
+        probs = predict_with_keras(model_path, sample_array)
+
+    candidates = []
+    best_candidate = None
+    best_score = -1.0
+    for image_name, start, end in sample_ranges:
+        subset = probs[start:end]
+        predicted_digits = np.argmax(subset, axis=1)
+        predicted_label = "".join(str(int(digit)) for digit in predicted_digits)
+        confidences = [
+            float(subset[i, predicted_digits[i]])
+            for i in range(len(predicted_digits))
+        ]
+        score = (0.65 * float(np.mean(confidences))) + (0.35 * float(np.min(confidences)))
+        candidate = {
+            "image_name": image_name,
+            "predicted_label": predicted_label,
+            "confidences": confidences,
+            "score": score,
+        }
+        candidates.append(candidate)
+        if score > best_score:
+            best_score = score
+            best_candidate = candidate
+
+    candidates.sort(key=lambda item: float(item.get("score", 0.0)), reverse=True)
+    if best_candidate is not None:
+        log(
+            f"[LeNet] Batch prediction complete. Best={best_candidate['predicted_label']} "
+            f"from {best_candidate['image_name']} score={float(best_candidate['score']):.4f}"
+        )
+
+    print(json.dumps({
+        "best": best_candidate or {},
+        "candidates": candidates,
+    }))
+
+
+def command_predict_digits(args: argparse.Namespace):
+    try:
+        import tensorflow as tf  # noqa: F401
+    except Exception as exc:
+        raise RuntimeError(
+            "TensorFlow is not available in the selected backend Python. "
+            "Use a Python 3.10-3.13 environment with TensorFlow installed."
+        ) from exc
+
+    model_path = Path(args.model_path)
+    images_dir = Path(args.images_dir)
+    image_paths = sorted(
+        p for p in images_dir.iterdir()
+        if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
+    )
+    if not image_paths:
+        raise ValueError("No digit candidate images were found.")
+
+    log(f"[LeNet] Predict-digits on {len(image_paths)} candidates from {images_dir}")
+
+    samples: list[np.ndarray] = []
+    valid_names: list[str] = []
+    for image_path in image_paths:
+        image = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
+        if image is None:
+            continue
+        sample = cv2.bitwise_not(image) if args.invert_input else image
+        samples.append(prepare_digit_image(sample))
+        valid_names.append(image_path.stem)
+
+    if not samples:
+        raise ValueError("No readable digit candidate images were found.")
+
+    sample_array = np.asarray(samples, dtype=np.float32)[..., np.newaxis]
+    if model_path.suffix.lower() == ".tflite":
+        probs = predict_with_tflite(model_path, sample_array)
+    else:
+        probs = predict_with_keras(model_path, sample_array)
+
+    candidates = []
+    for idx, image_name in enumerate(valid_names):
+        prob = probs[idx]
+        predicted_digit = int(np.argmax(prob))
+        confidence = float(prob[predicted_digit])
+        candidates.append({
+            "image_name": image_name,
+            "predicted_label": str(predicted_digit),
+            "confidence": confidence,
+            "score": confidence,
+        })
+
+    candidates.sort(key=lambda item: float(item.get("confidence", 0.0)), reverse=True)
+    print(json.dumps({"candidates": candidates}))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -301,6 +465,17 @@ def build_parser() -> argparse.ArgumentParser:
     predict_parser.add_argument("--model-path", required=True)
     predict_parser.add_argument("--image-path", required=True)
     predict_parser.add_argument("--expected-label", default="")
+    predict_parser.add_argument("--invert-input", action="store_true")
+
+    batch_predict_parser = subparsers.add_parser("predict-batch")
+    batch_predict_parser.add_argument("--model-path", required=True)
+    batch_predict_parser.add_argument("--images-dir", required=True)
+    batch_predict_parser.add_argument("--invert-input", action="store_true")
+
+    predict_digits_parser = subparsers.add_parser("predict-digits")
+    predict_digits_parser.add_argument("--model-path", required=True)
+    predict_digits_parser.add_argument("--images-dir", required=True)
+    predict_digits_parser.add_argument("--invert-input", action="store_true")
 
     return parser
 
@@ -315,6 +490,12 @@ def main():
             return
         if args.command == "predict":
             command_predict(args)
+            return
+        if args.command == "predict-batch":
+            command_predict_batch(args)
+            return
+        if args.command == "predict-digits":
+            command_predict_digits(args)
             return
         raise ValueError(f"Unsupported command: {args.command}")
     except Exception as exc:

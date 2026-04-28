@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
 
-# Remove set -e to allow catching errors properly
-# Change to the directory where the script is located
 cd "$(dirname "$0")"
 
 echo "========================================================"
@@ -9,38 +7,70 @@ echo "      DigitExtractor - Desktop Launcher (macOS/Linux)   "
 echo "========================================================"
 echo ""
 
-# Check for Python 3
-if ! command -v python3 &> /dev/null; then
-    echo "[ERROR] Python 3 is not installed or not in your PATH."
-    echo "Please install Python 3. (e.g., download from python.org or run 'brew install python')"
+PYTHON_CMD=""
+for candidate in python3.14 python3 python; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+        if "$candidate" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' >/dev/null 2>&1; then
+            PYTHON_CMD="$candidate"
+            break
+        fi
+    fi
+done
+
+if [ -z "$PYTHON_CMD" ]; then
+    echo "[ERROR] Python 3.10 or newer is required to run main.py."
+    echo "[INFO] Python 3.14 is recommended for the app runtime."
+    echo "[INFO] Install Python from python.org or your package manager."
     read -p "Press [Enter] to exit..."
     exit 1
 fi
 
-# Check if the .venv folder exists, if not, create it
+PYTHON_VERSION=$("$PYTHON_CMD" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")')
+echo "[*] Using Python $PYTHON_VERSION"
+
 if [ ! -d ".venv" ]; then
-    echo "[*] First time setup: Creating hidden local virtual environment .venv ..."
-    python3 -m venv .venv
+    echo "[*] First time setup: Creating local virtual environment .venv ..."
+    "$PYTHON_CMD" -m venv .venv || {
+        echo "[ERROR] Failed to create .venv"
+        read -p "Press [Enter] to exit..."
+        exit 1
+    }
 fi
 
-# Activate the environment
-echo "[*] Verifying dependencies..."
-source .venv/bin/activate
+echo "[*] Installing runtime dependencies for main.py..."
+source .venv/bin/activate || {
+    echo "[ERROR] Failed to activate .venv"
+    read -p "Press [Enter] to exit..."
+    exit 1
+}
 
-# Upgrade pip and install requirements quietly
-python3 -m pip install --upgrade pip --quiet
-python3 -m pip install -r requirements.txt --quiet
+python -m pip install --upgrade pip --quiet || {
+    echo ""
+    echo "[ERROR] Failed to upgrade pip."
+    deactivate >/dev/null 2>&1 || true
+    read -p "Press [Enter] to exit..."
+    exit 1
+}
 
-# Launch the Application
+python -m pip install -r requirements.txt --quiet || {
+    echo ""
+    echo "[ERROR] Failed to install runtime requirements from requirements.txt"
+    echo "[INFO] Training dependencies are not installed by this launcher."
+    deactivate >/dev/null 2>&1 || true
+    read -p "Press [Enter] to exit..."
+    exit 1
+}
+
 echo "[*] Launching application..."
-python3 main.py
+python main.py
+APP_EXIT=$?
 
-# Check for crash
-if [ $? -ne 0 ]; then
+deactivate >/dev/null 2>&1 || true
+
+if [ "$APP_EXIT" -ne 0 ]; then
     echo ""
     echo "[ERROR] Application crashed. See error above."
     read -p "Press [Enter] to exit..."
 fi
 
-# Deactivate gracefully when main.py exits
-deactivate
+exit "$APP_EXIT"

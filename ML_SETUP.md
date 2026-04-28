@@ -39,7 +39,7 @@ In `Training > Train LeNet-5 Digit Model...`, set `Backend Python` to:
 
 The same backend Python should also be used for testing.
 
-## 4. Training workflow
+## 4. LeNet Training workflow
 
 1. Open `Training > Train LeNet-5 Digit Model...`
 2. Select the dataset folder that contains `0` to `9`
@@ -55,7 +55,7 @@ Outputs:
 - `labels.json`
 - `metrics.json`
 
-## 5. Testing workflow
+## 5. LeNet Testing workflow
 
 1. Open `Testing > Select LeNet-5 Model...`
 2. Pick the `.tflite` or `.keras` model
@@ -69,8 +69,35 @@ Optional:
 - Type an expected 5-digit label in the label box before predicting
 - The app will compare the prediction against it
 
+## 6. YOLOv8 Training workflow
+
+1. Open `Training > Train YOLOv8 Finder...`
+2. Select the `ROI_640` folder
+3. Select the `ROI_640_labels` folder
+4. Select the output folder
+5. Choose the backend Python
+6. Start training
+
+Outputs:
+
+- YOLO `best.pt`
+- optional TFLite export if the backend can export it
+- `yolo_metrics.json`
+
+## 7. YOLOv8 + LeNet Testing workflow
+
+1. Open `Testing > Select YOLOv8 Finder Model...`
+2. Open `Testing > Select LeNet-5 Model...` if you want auto reading too
+3. Enable `Auto Find Strip` to let YOLO detect on file selection
+4. Enable `Auto Read` to let YOLO detect and then LeNet read automatically
+5. Click files in the sidebar and the app will auto-process them
+
+You can still manually readjust the points after YOLO places them.
+
 ## Notes
 
 - Training runs in a background thread so the UI stays responsive.
 - Viewer testing reuses the app's existing 4-point extraction pipeline.
-- The current implementation is for LeNet-5 only. YOLOv8 can be added later on top of the same modular backend pattern.
+- LeNet reads digits.
+- YOLOv8 finds the strip.
+- `Auto Read` is the combined mode: YOLO finds first, then LeNet reads.
