@@ -1,4 +1,5 @@
-# Runtime dependencies for launching main.py only.
+# Runtime dependencies for launching main.py (dual-mode dataset exporter).
+# The original guidebox-only UI is now in main_guidebox.py.
 # Training/testing backends should use training_requirements.txt separately.
 PyQt6>=6.6.0
 opencv-python>=4.8.0
