@@ -26,9 +26,24 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from lenet_backend import count_dataset_images, compute_adaptive_params
+
 
 class LeNetTrainingDialog(QDialog):
-    """Collect parameters for LeNet-style digit training."""
+    """Collect parameters for LeNet-style digit training.
+
+    Supports the new caption-based dataset layout::
+
+        1 - Full           digit 1, full visibility
+        1 - Going 2        digit 2 rising into view; label = 1
+        1 - Rolling from 0 digit 0 fading out above; label = 1
+
+    as well as the legacy plain-digit folder layout (0, 1, … 9).
+
+    Use **Scan & Auto-Tune** to count all images in the selected folder and
+    pre-fill Epochs, Batch Size, Dropout, and Learning Rate with values
+    optimised for that dataset size.  All fields remain editable.
+    """
 
     def __init__(
         self,
@@ -41,13 +56,15 @@ class LeNetTrainingDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Train LeNet-5 Digit Model")
         self.setModal(True)
-        self.setMinimumWidth(760)
+        self.setMinimumWidth(800)
 
         layout = QVBoxLayout(self)
 
         intro = QLabel(
-            "Train a LeNet-style digit classifier from your 0-9 folders and export "
-            "both a TensorFlow/Keras model and a TFLite model."
+            "Train a LeNet-style digit classifier and export both a TensorFlow/Keras "
+            "model and a TFLite model. Dataset folders may use the new caption format "
+            "('1 - Full', '1 - Going 2', '1 - Rolling from 0') or the legacy plain-digit "
+            "format ('0' … '9')."
         )
         intro.setWordWrap(True)
         layout.addWidget(intro)
@@ -60,8 +77,24 @@ class LeNetTrainingDialog(QDialog):
         note.setStyleSheet("color: #f0d27a;")
         layout.addWidget(note)
 
+        # ── Auto-tune banner ───────────────────────────────────────────────
+        autotune_row = QHBoxLayout()
+        self._autotune_label = QLabel("Click 'Scan & Auto-Tune' after selecting a dataset folder.")
+        self._autotune_label.setStyleSheet("color: #8ecae6;")
+        self._autotune_label.setWordWrap(True)
+        autotune_btn = QPushButton("Scan && Auto-Tune")
+        autotune_btn.setToolTip(
+            "Counts images in the dataset folder and fills Epochs, Batch Size, "
+            "Dropout Rate, and Learning Rate with values optimised for that size."
+        )
+        autotune_btn.clicked.connect(self._auto_tune)
+        autotune_row.addWidget(self._autotune_label, stretch=1)
+        autotune_row.addWidget(autotune_btn)
+        layout.addLayout(autotune_row)
+
         form = QFormLayout()
 
+        # Dataset folder
         dataset_row = QHBoxLayout()
         self._dataset_edit = QLineEdit(dataset_dir)
         dataset_btn = QPushButton("Browse...")
@@ -70,6 +103,7 @@ class LeNetTrainingDialog(QDialog):
         dataset_row.addWidget(dataset_btn)
         form.addRow("Dataset Folder:", self._wrap_layout(dataset_row))
 
+        # Output folders
         keras_row = QHBoxLayout()
         self._keras_output_edit = QLineEdit(keras_output_dir)
         keras_btn = QPushButton("Browse...")
@@ -86,6 +120,7 @@ class LeNetTrainingDialog(QDialog):
         tflite_row.addWidget(tflite_btn)
         form.addRow("TFLite Output:", self._wrap_layout(tflite_row))
 
+        # Backend Python
         backend_row = QHBoxLayout()
         self._backend_edit = QLineEdit(backend_python)
         backend_btn = QPushButton("Browse...")
@@ -94,15 +129,45 @@ class LeNetTrainingDialog(QDialog):
         backend_row.addWidget(backend_btn)
         form.addRow("Backend Python:", self._wrap_layout(backend_row))
 
+        # ── Adaptive hyperparameters ───────────────────────────────────────
         self._epochs_spin = QSpinBox()
         self._epochs_spin.setRange(1, 500)
         self._epochs_spin.setValue(20)
+        self._epochs_spin.setToolTip("Number of full passes through the training set.")
         form.addRow("Epochs:", self._epochs_spin)
 
         self._batch_size_spin = QSpinBox()
         self._batch_size_spin.setRange(4, 512)
         self._batch_size_spin.setValue(32)
+        self._batch_size_spin.setToolTip("Images processed per gradient update.")
         form.addRow("Batch Size:", self._batch_size_spin)
+
+        self._dropout_spin = QDoubleSpinBox()
+        self._dropout_spin.setRange(0.0, 0.9)
+        self._dropout_spin.setSingleStep(0.05)
+        self._dropout_spin.setDecimals(2)
+        self._dropout_spin.setValue(0.30)
+        self._dropout_spin.setToolTip(
+            "Fraction of units randomly dropped during training to reduce overfitting. "
+            "Smaller datasets benefit from higher dropout."
+        )
+        form.addRow("Dropout Rate:", self._dropout_spin)
+
+        self._lr_spin = QDoubleSpinBox()
+        self._lr_spin.setRange(0.000001, 0.1)
+        self._lr_spin.setSingleStep(0.0001)
+        self._lr_spin.setDecimals(6)
+        self._lr_spin.setValue(0.001)
+        self._lr_spin.setToolTip("Adam optimiser learning rate.")
+        form.addRow("Learning Rate:", self._lr_spin)
+
+        self._patience_spin = QSpinBox()
+        self._patience_spin.setRange(0, 50)
+        self._patience_spin.setValue(5)
+        self._patience_spin.setToolTip(
+            "Epochs without val_accuracy improvement before stopping early. 0 = disabled."
+        )
+        form.addRow("Early Stop Patience:", self._patience_spin)
 
         self._validation_spin = QDoubleSpinBox()
         self._validation_spin.setRange(0.05, 0.5)
@@ -125,13 +190,57 @@ class LeNetTrainingDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
+    # ── Helpers ────────────────────────────────────────────────────────────
+
     def _wrap_layout(self, row_layout: QHBoxLayout) -> QWidget:
         widget = QWidget()
         widget.setLayout(row_layout)
         return widget
 
+    def _auto_tune(self):
+        """Scan the selected dataset folder and fill in adaptive hyperparameters."""
+        dataset_dir = self._dataset_edit.text().strip()
+        if not dataset_dir or not Path(dataset_dir).is_dir():
+            QMessageBox.warning(
+                self, "No Dataset", "Select a valid dataset folder first, then scan."
+            )
+            return
+
+        try:
+            n_total = count_dataset_images(Path(dataset_dir))
+        except Exception as exc:
+            QMessageBox.warning(self, "Scan Failed", str(exc))
+            return
+
+        if n_total == 0:
+            QMessageBox.warning(
+                self, "Empty Dataset",
+                "No recognised image files found in the dataset folder."
+            )
+            return
+
+        validation_split = float(self._validation_spin.value())
+        params = compute_adaptive_params(n_total, validation_split)
+
+        self._epochs_spin.setValue(params["epochs"])
+        self._batch_size_spin.setValue(params["batch_size"])
+        self._dropout_spin.setValue(round(params["dropout_rate"], 2))
+        self._lr_spin.setValue(params["learning_rate"])
+        self._patience_spin.setValue(params["early_stopping_patience"])
+
+        self._autotune_label.setText(
+            f"Auto-tuned for {n_total:,} images — "
+            f"epochs={params['epochs']}, batch={params['batch_size']}, "
+            f"dropout={params['dropout_rate']:.2f}, "
+            f"patience={params['early_stopping_patience']}."
+        )
+
+    # ── Browse callbacks ───────────────────────────────────────────────────
+
     def _browse_dataset(self):
-        folder = QFileDialog.getExistingDirectory(self, "Select 0-9 Dataset Folder")
+        folder = QFileDialog.getExistingDirectory(
+            self, "Select Dataset Folder (caption-based or plain 0-9)"
+        )
         if folder:
             self._dataset_edit.setText(folder)
 
@@ -154,6 +263,8 @@ class LeNetTrainingDialog(QDialog):
         )
         if path:
             self._backend_edit.setText(path)
+
+    # ── Validation & result ────────────────────────────────────────────────
 
     def _on_accept(self):
         dataset_dir = self._dataset_edit.text().strip()
@@ -199,6 +310,9 @@ class LeNetTrainingDialog(QDialog):
             "backend_python": self._backend_edit.text().strip(),
             "epochs": int(self._epochs_spin.value()),
             "batch_size": int(self._batch_size_spin.value()),
+            "dropout_rate": float(self._dropout_spin.value()),
+            "learning_rate": float(self._lr_spin.value()),
+            "early_stopping_patience": int(self._patience_spin.value()),
             "validation_split": float(self._validation_spin.value()),
             "seed": int(self._seed_spin.value()),
         }

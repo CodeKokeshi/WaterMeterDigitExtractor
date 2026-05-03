@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -19,10 +20,116 @@ IMAGE_EXTENSIONS = {
     ".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".webp", ".heic", ".heif"
 }
 
+# ── Folder naming ────────────────────────────────────────────────────────────
+# New caption-based format:  "1 - Full"  /  "1 - Going 2"  /  "1 - Rolling from 0"
+# Legacy format:             plain digit folders "0" … "9"
+_CAPTION_FOLDER_RE = re.compile(r"^(\d)\s*-\s*(.+)$")
+
 
 def log(message: str):
     print(message, flush=True)
 
+
+# ── Dataset folder helpers ───────────────────────────────────────────────────
+
+def _iter_digit_folders(dataset_dir: Path):
+    """Yield (digit, folder_path, caption) for every recognised dataset folder.
+
+    Caption types (new format)
+    --------------------------
+    Full            - the digit is completely visible (a rolling digit may peek
+                      above or below but the label digit dominates the frame).
+    Going <X>       - digit X is rising into view from below; the label digit
+                      still dominates but X's top is visible.
+    Rolling from <X>- digit X above is fading out; the label digit is emerging
+                      and dominates the frame.
+    """
+    for entry in sorted(dataset_dir.iterdir()):
+        if not entry.is_dir():
+            continue
+        name = entry.name
+
+        # New format: "1 - Full", "1 - Going 2", "1 - Rolling from 0"
+        m = _CAPTION_FOLDER_RE.match(name)
+        if m:
+            digit = int(m.group(1))
+            caption = m.group(2).strip()
+            yield digit, entry, caption
+            continue
+
+        # Legacy format: plain single-digit folder name
+        if name.isdigit() and len(name) == 1:
+            yield int(name), entry, "Full"
+
+
+def count_dataset_images(dataset_dir: Path) -> int:
+    """Quickly count images in a dataset directory without loading them."""
+    total = 0
+    for _digit, folder, _caption in _iter_digit_folders(dataset_dir):
+        for img_entry in folder.iterdir():
+            if img_entry.is_file() and img_entry.suffix.lower() in IMAGE_EXTENSIONS:
+                total += 1
+    return total
+
+
+# ── Adaptive hyperparameter engine ──────────────────────────────────────────
+
+def compute_adaptive_params(n_total: int, validation_split: float) -> dict:
+    """Return adaptive training hyperparameters scaled to dataset size.
+
+    The goal is ~100 000 gradient-update steps per training run so the model
+    always receives a consistent amount of *work*, whether you have 5 000
+    images or 500 000.
+
+    Parameters
+    ----------
+    n_total:          total image count (before splitting)
+    validation_split: fraction reserved for validation (e.g. 0.20)
+
+    Returns
+    -------
+    dict with keys: batch_size, epochs, dropout_rate,
+                    early_stopping_patience, learning_rate
+    """
+    n_train = max(1, int(n_total * (1.0 - validation_split)))
+
+    # Batch size — larger datasets tolerate bigger batches
+    if n_train < 5_000:
+        batch_size = 32
+    elif n_train < 25_000:
+        batch_size = 64
+    else:
+        batch_size = 128
+
+    # Epochs: target ~100 000 gradient steps total
+    TARGET_STEPS = 100_000
+    steps_per_epoch = max(1, n_train // batch_size)
+    epochs = max(5, min(50, round(TARGET_STEPS / steps_per_epoch)))
+
+    # Dropout — larger datasets provide implicit regularisation
+    if n_train < 5_000:
+        dropout_rate = 0.50
+    elif n_train < 25_000:
+        dropout_rate = 0.35
+    else:
+        dropout_rate = 0.20
+
+    # Early stopping patience (epochs without improvement before halting)
+    patience = max(3, min(10, epochs // 5))
+
+    # Adam learning rate — default 1e-3 works well at all scales
+    learning_rate = 1e-3
+
+    return {
+        "batch_size": batch_size,
+        "epochs": epochs,
+        "dropout_rate": dropout_rate,
+        "early_stopping_patience": patience,
+        "learning_rate": learning_rate,
+    }
+
+
+# ── Image / strip helpers ────────────────────────────────────────────────────
 
 def split_strip_segments(strip: np.ndarray) -> list[np.ndarray]:
     segments: list[np.ndarray] = []
@@ -50,7 +157,6 @@ def prepare_strip_image(path: str) -> tuple[np.ndarray, list[np.ndarray]]:
     image = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
     if image is None:
         raise ValueError(f"Cannot read strip image: {path}")
-
     return prepare_strip_array(image)
 
 
@@ -64,35 +170,64 @@ def prepare_strip_array(image: np.ndarray) -> tuple[np.ndarray, list[np.ndarray]
     return strip, segments
 
 
+# ── Dataset loader ───────────────────────────────────────────────────────────
+
 def load_digit_dataset(dataset_dir: Path) -> tuple[np.ndarray, np.ndarray, dict[str, int]]:
+    """Load images from a dataset directory.
+
+    Supports two folder-naming conventions (they can coexist in the same root):
+
+    **New caption-based** (one or more subfolders per digit)::
+
+        1 - Full           digit 1 is clearly visible
+        1 - Going 2        digit 2 is rising into view from below; label = 1
+        1 - Rolling from 0 digit 0 is fading out above;      label = 1
+
+    **Legacy** (plain digit folders)::
+
+        0   1   2   …   9
+
+    All folders whose name starts with the same digit are merged into that
+    digit's class so the label is always the *dominant* digit.
+    """
+    # Collect folder paths per digit
+    digit_folders: dict[int, list[tuple[Path, str]]] = {d: [] for d in range(10)}
+    for digit, folder, caption in _iter_digit_folders(dataset_dir):
+        digit_folders[digit].append((folder, caption))
+
+    # Every digit class must be represented
+    missing = [str(d) for d in range(10) if not digit_folders[d]]
+    if missing:
+        raise ValueError(
+            f"Missing folders for digits: {', '.join(missing)}. "
+            "Create at least one folder per digit, e.g. '3 - Full' or plain '3'."
+        )
+
     images: list[np.ndarray] = []
     labels: list[int] = []
     counts: dict[str, int] = {}
 
     for digit in range(10):
-        class_dir = dataset_dir / str(digit)
-        if not class_dir.is_dir():
-            raise ValueError(f"Missing required class folder: {class_dir}")
-
         count = 0
-        for entry in sorted(class_dir.iterdir()):
-            if not entry.is_file() or entry.suffix.lower() not in IMAGE_EXTENSIONS:
-                continue
-            img = cv2.imread(str(entry), cv2.IMREAD_GRAYSCALE)
-            if img is None:
-                continue
-            images.append(prepare_digit_image(img))
-            labels.append(digit)
-            count += 1
+        for folder, _caption in digit_folders[digit]:
+            for entry in sorted(folder.iterdir()):
+                if not entry.is_file() or entry.suffix.lower() not in IMAGE_EXTENSIONS:
+                    continue
+                img = cv2.imread(str(entry), cv2.IMREAD_GRAYSCALE)
+                if img is None:
+                    continue
+                images.append(prepare_digit_image(img))
+                labels.append(digit)
+                count += 1
         counts[str(digit)] = count
 
     if not images:
         raise ValueError("No readable training images found in the dataset.")
 
-    too_small = [digit for digit, count in counts.items() if count < 2]
+    too_small = [d for d, c in counts.items() if c < 2]
     if too_small:
         raise ValueError(
-            "Each digit folder needs at least 2 readable images for training. "
+            "Each digit class needs at least 2 readable images for training. "
             f"Too small: {', '.join(too_small)}"
         )
 
@@ -134,7 +269,14 @@ def stratified_split(
     return x[train_indices], y[train_indices], x[val_indices], y[val_indices]
 
 
-def build_lenet5_model(tf):
+# ── Model builder ────────────────────────────────────────────────────────────
+
+def build_lenet5_model(tf, dropout_rate: float = 0.3):
+    """Build LeNet-5 with a configurable dropout layer for regularisation.
+
+    Dropout sits between the two fully-connected layers (Dense 120 → Dense 84)
+    where overfitting most often appears in small-to-medium datasets.
+    """
     keras = tf.keras
     return keras.Sequential([
         keras.layers.Input(shape=(SEGMENT_SIZE, SEGMENT_SIZE, 1)),
@@ -144,10 +286,13 @@ def build_lenet5_model(tf):
         keras.layers.AveragePooling2D(pool_size=2),
         keras.layers.Flatten(),
         keras.layers.Dense(120, activation="relu"),
+        keras.layers.Dropout(dropout_rate),
         keras.layers.Dense(84, activation="relu"),
         keras.layers.Dense(10, activation="softmax"),
     ])
 
+
+# ── Training command ─────────────────────────────────────────────────────────
 
 def command_train(args: argparse.Namespace):
     try:
@@ -165,51 +310,102 @@ def command_train(args: argparse.Namespace):
     tflite_output_dir.mkdir(parents=True, exist_ok=True)
 
     x, y, counts = load_digit_dataset(dataset_dir)
-    log(f"[LeNet] Loaded dataset with {len(x)} images.")
+    n_total = len(x)
+    log(f"[LeNet] Loaded dataset with {n_total} images.")
+
+    # ── Resolve adaptive hyperparameters ────────────────────────────────────
+    adaptive = compute_adaptive_params(n_total, args.validation_split)
+
+    # A value of 0 (or negative for floats) means "let the engine decide"
+    epochs        = args.epochs        if args.epochs        > 0    else adaptive["epochs"]
+    batch_size    = args.batch_size    if args.batch_size    > 0    else adaptive["batch_size"]
+    dropout_rate  = args.dropout_rate  if args.dropout_rate  >= 0.0 else adaptive["dropout_rate"]
+    learning_rate = args.learning_rate if args.learning_rate > 0.0  else adaptive["learning_rate"]
+    patience      = (
+        args.early_stopping_patience
+        if args.early_stopping_patience >= 0
+        else adaptive["early_stopping_patience"]
+    )
+
+    log(
+        f"[LeNet] Hyperparams — epochs={epochs}, batch={batch_size}, "
+        f"dropout={dropout_rate:.2f}, lr={learning_rate:.5f}, "
+        f"early_stop_patience={patience}"
+    )
+
     x_train, y_train, x_val, y_val = stratified_split(
-        x,
-        y,
-        validation_split=args.validation_split,
-        seed=args.seed,
+        x, y, validation_split=args.validation_split, seed=args.seed,
     )
     log(
-        f"[LeNet] Train/val split ready. Train={len(x_train)} images, "
-        f"Val={len(x_val)} images, Epochs={args.epochs}, Batch={args.batch_size}."
+        f"[LeNet] Train/val split ready. Train={len(x_train)}, "
+        f"Val={len(x_val)}, Epochs={epochs}, Batch={batch_size}."
     )
 
     tf.keras.utils.set_random_seed(args.seed)
 
-    model = build_lenet5_model(tf)
+    model = build_lenet5_model(tf, dropout_rate=dropout_rate)
     model.compile(
-        optimizer="adam",
+        optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
         loss="sparse_categorical_crossentropy",
         metrics=["accuracy"],
     )
+
+    # ── Callbacks ────────────────────────────────────────────────────────────
+    callbacks: list = []
 
     class EpochLogger(tf.keras.callbacks.Callback):
         def on_epoch_end(self, epoch, logs=None):
             logs = logs or {}
             log(
                 "[LeNet] "
-                f"Epoch {epoch + 1}/{args.epochs} "
+                f"Epoch {epoch + 1}/{epochs} "
                 f"loss={float(logs.get('loss', 0.0)):.4f} "
                 f"acc={float(logs.get('accuracy', 0.0)):.4f} "
                 f"val_loss={float(logs.get('val_loss', 0.0)):.4f} "
                 f"val_acc={float(logs.get('val_accuracy', 0.0)):.4f}"
             )
 
+    callbacks.append(EpochLogger())
+
+    if patience > 0:
+        # Stop early when val_accuracy plateaus
+        callbacks.append(
+            tf.keras.callbacks.EarlyStopping(
+                monitor="val_accuracy",
+                patience=patience,
+                restore_best_weights=True,
+                verbose=0,
+            )
+        )
+        # Halve the learning rate when val_loss stalls
+        callbacks.append(
+            tf.keras.callbacks.ReduceLROnPlateau(
+                monitor="val_loss",
+                factor=0.5,
+                patience=max(2, patience // 2),
+                min_lr=1e-6,
+                verbose=0,
+            )
+        )
+
     history = model.fit(
         x_train,
         y_train,
         validation_data=(x_val, y_val),
-        epochs=args.epochs,
-        batch_size=args.batch_size,
+        epochs=epochs,
+        batch_size=batch_size,
         verbose=0,
-        callbacks=[EpochLogger()],
+        callbacks=callbacks,
     )
 
+    actual_epochs = len(history.history["accuracy"])
+
     test_loss, test_accuracy = model.evaluate(x_val, y_val, verbose=0)
-    log(f"[LeNet] Evaluation complete. test_loss={float(test_loss):.4f} test_acc={float(test_accuracy):.4f}")
+    log(
+        f"[LeNet] Evaluation complete. "
+        f"test_loss={float(test_loss):.4f} test_acc={float(test_accuracy):.4f} "
+        f"(ran {actual_epochs}/{epochs} epochs)"
+    )
 
     keras_path = keras_output_dir / "lenet5_digits.keras"
     model.save(keras_path)
@@ -223,10 +419,14 @@ def command_train(args: argparse.Namespace):
     labels_path.write_text(json.dumps([str(i) for i in range(10)], indent=2), encoding="utf-8")
 
     metrics = {
-        "dataset_size": int(len(x)),
+        "dataset_size": int(n_total),
         "class_counts": counts,
-        "epochs": int(args.epochs),
-        "batch_size": int(args.batch_size),
+        "epochs_planned": int(epochs),
+        "epochs_actual": int(actual_epochs),
+        "batch_size": int(batch_size),
+        "dropout_rate": float(dropout_rate),
+        "learning_rate": float(learning_rate),
+        "early_stopping_patience": int(patience),
         "train_accuracy": float(history.history["accuracy"][-1]),
         "val_accuracy": float(history.history["val_accuracy"][-1]),
         "test_accuracy": float(test_accuracy),
@@ -241,6 +441,8 @@ def command_train(args: argparse.Namespace):
     log("[LeNet] Training complete. Writing final metrics JSON.")
     print(json.dumps(metrics))
 
+
+# ── Inference commands ───────────────────────────────────────────────────────
 
 def predict_with_keras(model_path: Path, samples: np.ndarray):
     import tensorflow as tf
@@ -311,10 +513,19 @@ def command_predict(args: argparse.Namespace):
     predicted_label = "".join(str(int(digit)) for digit in predicted_digits)
     confidences = [float(probs[i, predicted_digits[i]]) for i in range(len(predicted_digits))]
 
+    # Full per-segment softmax (5 x 10) so the UI can do top-2 analysis
+    # for the rolling-context reader (Full / Going X / Rolling from X).
+    # Rounded to 6 decimals to keep the JSON small.
+    probs_list = [
+        [round(float(v), 6) for v in row]
+        for row in probs
+    ]
+
     result = {
         "predicted_label": predicted_label,
         "expected_label": args.expected_label or "",
         "confidences": confidences,
+        "probs": probs_list,
     }
     log(f"[LeNet] Prediction complete: {predicted_label}")
     print(json.dumps(result))
@@ -448,6 +659,8 @@ def command_predict_digits(args: argparse.Namespace):
     print(json.dumps({"candidates": candidates}))
 
 
+# ── Argument parser ──────────────────────────────────────────────────────────
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -456,8 +669,26 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--dataset-dir", required=True)
     train_parser.add_argument("--keras-output-dir", required=True)
     train_parser.add_argument("--tflite-output-dir", required=True)
-    train_parser.add_argument("--epochs", type=int, default=20)
-    train_parser.add_argument("--batch-size", type=int, default=32)
+    train_parser.add_argument(
+        "--epochs", type=int, default=0,
+        help="Training epochs. 0 = auto-adapt based on dataset size.",
+    )
+    train_parser.add_argument(
+        "--batch-size", type=int, default=0,
+        help="Mini-batch size. 0 = auto-adapt based on dataset size.",
+    )
+    train_parser.add_argument(
+        "--dropout-rate", type=float, default=-1.0,
+        help="Dropout rate 0-1. Negative = auto-adapt based on dataset size.",
+    )
+    train_parser.add_argument(
+        "--learning-rate", type=float, default=0.0,
+        help="Adam learning rate. 0 = auto-adapt (default 0.001).",
+    )
+    train_parser.add_argument(
+        "--early-stopping-patience", type=int, default=-1,
+        help="Epochs without improvement before stopping. Negative = auto-adapt. 0 = disabled.",
+    )
     train_parser.add_argument("--validation-split", type=float, default=0.2)
     train_parser.add_argument("--seed", type=int, default=42)
 
