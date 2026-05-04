@@ -848,8 +848,12 @@ class YoloTesterWindow(QMainWindow):
             if crop.size == 0:
                 continue
             resized = cv2.resize(crop, (MODEL_IMAGE_SIZE, MODEL_IMAGE_SIZE), interpolation=cv2.INTER_AREA)
+            # Convert to 3-channel grayscale for inference so the input
+            # colour-space matches what the model was trained on.
+            _gray    = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+            _infer   = cv2.cvtColor(_gray,   cv2.COLOR_GRAY2BGR)
             results = self._model.predict(  # type: ignore[union-attr]
-                source=resized,
+                source=_infer,
                 imgsz=MODEL_IMAGE_SIZE,
                 verbose=False,
             )
