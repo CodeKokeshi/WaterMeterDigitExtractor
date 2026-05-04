@@ -11,17 +11,21 @@ Controls:
 
 Requirements:
   pip install ultralytics opencv-python PyQt6 numpy
+  pip install pillow pillow-heif   # for HEIC/HEIF support
 """
 
 from __future__ import annotations
 
+import importlib
 import sys
 from pathlib import Path
 
 import cv2
 import numpy as np
 
-from PyQt6.QtCore import QRectF, Qt
+import threading
+
+from PyQt6.QtCore import QObject, QRectF, QRunnable, QSettings, Qt, QThreadPool, QTimer, pyqtSignal
 from PyQt6.QtGui import (
     QBrush,
     QColor,
@@ -35,6 +39,7 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtWidgets import (
     QApplication,
+    QDialog,
     QFileDialog,
     QGraphicsPixmapItem,
     QGraphicsScene,
@@ -42,11 +47,16 @@ from PyQt6.QtWidgets import (
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QMainWindow,
+    QProgressBar,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QStatusBar,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -62,7 +72,21 @@ except ImportError:
     ULTRALYTICS_AVAILABLE = False
 
 
-IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".webp"}
+# ---------------------------------------------------------------------------
+# Persistent settings (QSettings keys — mirrors main.py pattern)
+# ---------------------------------------------------------------------------
+SETTINGS_ORG            = "DigitExtractor"
+SETTINGS_APP            = "YoloTester"
+SETTINGS_LAST_IMAGE_DIR = "paths/last_image_dir"
+SETTINGS_LAST_MODEL_DIR = "paths/last_model_dir"
+
+# ---------------------------------------------------------------------------
+# Supported image extensions (includes HEIC/HEIF)
+# ---------------------------------------------------------------------------
+IMAGE_EXTENSIONS = {
+    ".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".webp", ".heic", ".heif"
+}
+
 STRIP_CLASS_ID = 0
 DIGIT_OFFSET = 1
 UNREADABLE_CLS = 11
@@ -75,6 +99,57 @@ _COL_UNREAD = (60, 60, 230)
 _COL_TEXT_BG = (20, 20, 20)
 _COL_WINNER = (255, 210, 0)
 
+# ---------------------------------------------------------------------------
+# HEIC / HEIF decoder (lazy-loaded, mirrors main.py)
+# ---------------------------------------------------------------------------
+HEIF_DECODER_AVAILABLE = False
+_PIL_IMAGE_MODULE = None
+
+
+def _ensure_heif_decoder() -> bool:
+    global HEIF_DECODER_AVAILABLE, _PIL_IMAGE_MODULE
+    if HEIF_DECODER_AVAILABLE:
+        return True
+    try:
+        pillow_heif = importlib.import_module("pillow_heif")
+        pil_image = importlib.import_module("PIL.Image")
+        pillow_heif.register_heif_opener()
+        _PIL_IMAGE_MODULE = pil_image
+        HEIF_DECODER_AVAILABLE = True
+        return True
+    except Exception:
+        return False
+
+
+def read_image_any(path: str, flags: int = cv2.IMREAD_COLOR) -> np.ndarray | None:
+    """Read an image from disk, falling back to pillow-heif for HEIC/HEIF files."""
+    image = cv2.imread(path, flags)
+    if image is not None:
+        return image
+
+    ext = Path(path).suffix.lower()
+    if ext not in {".heic", ".heif"} or not _ensure_heif_decoder():
+        return None
+
+    try:
+        with _PIL_IMAGE_MODULE.open(path) as pil_img:
+            if flags == cv2.IMREAD_GRAYSCALE:
+                return np.array(pil_img.convert("L"))
+            if flags == cv2.IMREAD_UNCHANGED:
+                if "A" in pil_img.getbands():
+                    rgba = np.array(pil_img.convert("RGBA"))
+                    return cv2.cvtColor(rgba, cv2.COLOR_RGBA2BGRA)
+                rgb = np.array(pil_img.convert("RGB"))
+                return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+            rgb = np.array(pil_img.convert("RGB"))
+            return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Pure helper functions
+# ---------------------------------------------------------------------------
 
 def _rotate_cv(img: np.ndarray, angle: int) -> np.ndarray:
     a = angle % 360
@@ -281,10 +356,60 @@ def _pick_best_digit_subset(digit_dets: list[dict], desired: int = NUM_DIGITS) -
     return best_window
 
 
-def _build_reading_text(digit_dets: list[dict]) -> str:
+def _build_reading_text(digit_dets: list[dict], strip_det: dict | None = None) -> str:
+    """Build a reading string, inserting '?' for any positionally missing digit slots."""
     if not digit_dets:
-        return "-----"
-    return "".join(_digit_char(det["cls"]) for det in digit_dets)
+        return "?" * NUM_DIGITS
+
+    # ── Strip-based slot assignment (most accurate) ────────────────────────
+    if strip_det is not None:
+        strip_box = strip_det["box"]
+        strip_x1 = float(strip_box[0])
+        strip_x2 = float(strip_box[2])
+        strip_w   = max(strip_x2 - strip_x1, 1.0)
+        slot_w    = strip_w / NUM_DIGITS
+
+        # For each slot keep the highest-confidence digit
+        slot_best: dict[int, dict] = {}
+        for det in digit_dets:
+            cx       = _box_center_x(det["box"])
+            slot_idx = int((cx - strip_x1) / slot_w)
+            slot_idx = max(0, min(NUM_DIGITS - 1, slot_idx))
+            if slot_idx not in slot_best or det["conf"] > slot_best[slot_idx]["conf"]:
+                slot_best[slot_idx] = det
+
+        return "".join(
+            _digit_char(slot_best[i]["cls"]) if i in slot_best else "?"
+            for i in range(NUM_DIGITS)
+        )
+
+    # ── Gap-based slot assignment (fallback when no strip detected) ────────
+    sorted_dets = sorted(digit_dets, key=lambda d: _box_center_x(d["box"]))
+
+    if len(sorted_dets) >= NUM_DIGITS:
+        # All (or more) digits found — no gaps to fill
+        return "".join(_digit_char(d["cls"]) for d in sorted_dets[:NUM_DIGITS])
+
+    avg_width = sum(_box_width(d["box"]) for d in sorted_dets) / len(sorted_dets)
+    avg_width = max(avg_width, 1.0)
+
+    chars: list[str] = [_digit_char(sorted_dets[0]["cls"])]
+    for i in range(1, len(sorted_dets)):
+        prev_cx = _box_center_x(sorted_dets[i - 1]["box"])
+        curr_cx = _box_center_x(sorted_dets[i]["box"])
+        gap     = curr_cx - prev_cx
+        # Round to nearest number of digit-widths; subtract 1 for the current digit itself
+        missing = max(0, round(gap / avg_width) - 1)
+        # Cap so we never exceed the total expected digit count
+        missing = min(missing, NUM_DIGITS - len(chars) - (len(sorted_dets) - i))
+        chars.extend(["?"] * missing)
+        chars.append(_digit_char(sorted_dets[i]["cls"]))
+
+    # Pad any remaining missing digits at the end
+    while len(chars) < NUM_DIGITS:
+        chars.append("?")
+
+    return "".join(chars[:NUM_DIGITS])
 
 
 def _status_from_candidate(candidate: dict) -> str:
@@ -329,7 +454,7 @@ def _evaluate_window_candidate(dets: list[dict], window_index: int, total_window
         best_digits = _pick_best_digit_subset(digit_dets, NUM_DIGITS)
 
     best_digits = sorted(best_digits, key=lambda det: _box_center_x(det["box"]))
-    reading = _build_reading_text(best_digits)
+    reading = _build_reading_text(best_digits, best_strip)
     strip_conf = float(best_strip["conf"]) if best_strip is not None else 0.0
     digit_count = len(best_digits)
     digit_conf_avg = (
@@ -401,6 +526,10 @@ def _parse_result_detections(result, window: SlidingWindow) -> list[dict]:
     return dets
 
 
+# ---------------------------------------------------------------------------
+# Stylesheet
+# ---------------------------------------------------------------------------
+
 def _theme_stylesheet() -> str:
     return """
     QWidget {
@@ -411,6 +540,9 @@ def _theme_stylesheet() -> str:
     }
     QMainWindow {
         background: #14181d;
+    }
+    QDialog {
+        background: #0d1117;
     }
     QGroupBox {
         background: #1b2129;
@@ -497,8 +629,544 @@ def _theme_stylesheet() -> str:
         color: #aab8c7;
         border-top: 1px solid #212833;
     }
+    QProgressBar {
+        background: #1b2129;
+        border: none;
+        border-radius: 4px;
+    }
+    QProgressBar::chunk {
+        background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+            stop:0 #2563eb, stop:1 #7c3aed);
+        border-radius: 4px;
+    }
     """
 
+
+# ---------------------------------------------------------------------------
+# Process Preview Dialog — timelapse of the reading pipeline
+# ---------------------------------------------------------------------------
+
+class ProcessPreviewDialog(QDialog):
+    """
+    Non-blocking modal shown during the READING phase.
+
+    Displays a live "timelapse" of each pipeline step:
+      Original image → window sampling → crop extraction →
+      grayscale preprocessing → YOLO inference → detections → final result.
+
+    Call push_frame() from the inference loop to update each step.
+    Call finish() when done — auto-closes after a short delay.
+    """
+
+    # Step-name → accent colour (BGR for OpenCV overlays, hex for Qt labels)
+    _STEP_COLOURS: dict[str, str] = {
+        "original":    "#3b82f6",   # blue
+        "sampling":    "#06b6d4",   # cyan
+        "crop":        "#10b981",   # green
+        "preprocess":  "#f59e0b",   # amber
+        "inference":   "#8b5cf6",   # violet
+        "detections":  "#ec4899",   # pink
+        "result":      "#22c55e",   # bright green
+        "complete":    "#22c55e",
+    }
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Reading in Progress…")
+        self.setModal(False)
+        self.resize(880, 640)
+        self.setStyleSheet(_theme_stylesheet())
+
+        self._close_timer = QTimer(self)
+        self._close_timer.setSingleShot(True)
+        self._close_timer.timeout.connect(self.accept)
+
+        self._build_ui()
+
+    # ------------------------------------------------------------------
+    # UI construction
+    # ------------------------------------------------------------------
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(22, 18, 22, 18)
+        layout.setSpacing(10)
+
+        # ── Step title ──────────────────────────────────────────────────
+        self._step_label = QLabel("Initialising…")
+        self._step_label.setObjectName("titleLabel")
+        self._step_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self._step_label)
+
+        # ── Subtitle / description ───────────────────────────────────────
+        self._sub_label = QLabel("")
+        self._sub_label.setObjectName("subtitleLabel")
+        self._sub_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self._sub_label)
+
+        # ── Live frame canvas ────────────────────────────────────────────
+        self._canvas = QLabel()
+        self._canvas.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._canvas.setMinimumSize(600, 380)
+        self._canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._canvas.setStyleSheet(
+            "background: #060a0f; border: 1px solid #2d3744; border-radius: 14px;"
+        )
+        layout.addWidget(self._canvas, stretch=1)
+
+        # ── Progress bar ────────────────────────────────────────────────
+        self._progress = QProgressBar()
+        self._progress.setRange(0, 1000)
+        self._progress.setValue(0)
+        self._progress.setTextVisible(False)
+        self._progress.setFixedHeight(8)
+        layout.addWidget(self._progress)
+
+        # ── Window counter ───────────────────────────────────────────────
+        self._window_label = QLabel("")
+        self._window_label.setObjectName("metaLabel")
+        self._window_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self._window_label)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def push_frame(
+        self,
+        title: str,
+        image_bgr: np.ndarray,
+        subtitle: str = "",
+        progress: float = 0.0,
+        window_text: str = "",
+        accent_key: str = "original",
+    ) -> None:
+        """
+        Display a new frame with updated step title and progress.
+        Calls processEvents() internally so the UI stays live.
+        """
+        accent = self._STEP_COLOURS.get(accent_key, "#3b82f6")
+        self._step_label.setText(title)
+        self._step_label.setStyleSheet(
+            f"font-size: 16pt; font-weight: 700; color: {accent};"
+        )
+        self._sub_label.setText(subtitle)
+        self._progress.setValue(int(min(max(progress, 0.0), 1.0) * 1000))
+        self._window_label.setText(window_text)
+
+        # Render image into the canvas, scaled to fit
+        if image_bgr is not None and image_bgr.size > 0:
+            pix = _cv_to_pixmap(image_bgr)
+            avail = self._canvas.size()
+            if avail.width() > 10 and avail.height() > 10:
+                pix = pix.scaled(
+                    avail,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+            self._canvas.setPixmap(pix)
+
+        QApplication.processEvents()
+
+    def finish(self, delay_ms: int = 2000) -> None:
+        """Mark pipeline as complete and schedule auto-close."""
+        accent = self._STEP_COLOURS["complete"]
+        self._step_label.setText("✓  Reading Complete")
+        self._step_label.setStyleSheet(
+            f"font-size: 16pt; font-weight: 700; color: {accent};"
+        )
+        self._progress.setValue(1000)
+        self._window_label.setText("Closing in a moment…")
+        QApplication.processEvents()
+        self._close_timer.start(delay_ms)
+
+
+# ---------------------------------------------------------------------------
+# Standalone batch inference (module-level, safe to call from worker threads)
+# ---------------------------------------------------------------------------
+
+def _infer_image_batch(
+    path: Path,
+    model,
+    rotation: int,
+    model_lock: threading.Lock,
+) -> dict:
+    """
+    Run the full sliding-window inference pipeline on a single image.
+    Image loading, resizing, and pre/post-processing run freely in the
+    calling thread.  model.predict() is serialised via model_lock so that
+    only one thread drives the YOLO model at a time (safe for CPU & GPU).
+    Returns a result dict compatible with BatchReportDialog.add_result().
+    """
+    try:
+        image = read_image_any(str(path))
+        if image is None:
+            return {
+                "filename": path.name, "reading": "-----", "status": "Error",
+                "strip_conf": "--", "digit_count": "--", "window_label": "--",
+            }
+
+        rotated = _rotate_cv(image, rotation)
+        windows = build_sliding_windows(rotated.shape[1], rotated.shape[0])
+        total_windows = len(windows)
+
+        candidates: list[dict] = []
+        best_candidate: dict | None = None
+
+        for idx, window in enumerate(windows, start=1):
+            crop = rotated[window.y:window.y + window.size, window.x:window.x + window.size]
+            if crop.size == 0:
+                continue
+
+            resized = cv2.resize(crop, (MODEL_IMAGE_SIZE, MODEL_IMAGE_SIZE), interpolation=cv2.INTER_AREA)
+            _gray  = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+            _infer = cv2.cvtColor(_gray,   cv2.COLOR_GRAY2BGR)
+
+            # Serialise only the GPU/CPU inference call
+            with model_lock:
+                results = model.predict(source=_infer, imgsz=MODEL_IMAGE_SIZE, verbose=False)
+
+            dets = [] if not results else _parse_result_detections(results[0], window)
+            candidate = _evaluate_window_candidate(dets, idx, total_windows, window)
+            candidates.append(candidate)
+
+            if best_candidate is None or _candidate_rank(candidate) > _candidate_rank(best_candidate):
+                best_candidate = candidate
+
+            if candidate["valid"]:   # Early exit on first clean reading
+                break
+
+        if best_candidate is None:
+            return {
+                "filename": path.name, "reading": "?" * NUM_DIGITS, "status": "No Detection",
+                "strip_conf": "--", "digit_count": "0",
+                "window_label": f"-- / {total_windows}",
+            }
+
+        strip_conf_str = (
+            f"{best_candidate['strip_conf']:.0%}"
+            if best_candidate["strip_det"] is not None else "--"
+        )
+        return {
+            "filename":     path.name,
+            "reading":      best_candidate["reading"],
+            "status":       best_candidate["status"],
+            "strip_conf":   strip_conf_str,
+            "digit_count":  str(best_candidate["digit_count"]),
+            "window_label": f"{best_candidate['window_index']} / {best_candidate['total_windows']}",
+        }
+
+    except Exception as exc:
+        return {
+            "filename": path.name, "reading": "-----", "status": "Error",
+            "strip_conf": "--", "digit_count": f"err: {exc}", "window_label": "--",
+        }
+
+
+# ---------------------------------------------------------------------------
+# Batch worker (QRunnable + signals for thread → main-thread communication)
+# ---------------------------------------------------------------------------
+
+class _BatchWorkerSignals(QObject):
+    """Signals emitted by BatchImageWorker back to the main thread."""
+    result = pyqtSignal(int, dict)   # (original_index, result_dict)
+
+
+class BatchImageWorker(QRunnable):
+    """Processes one image on a QThreadPool thread and emits a result signal."""
+
+    def __init__(
+        self,
+        index: int,
+        path: Path,
+        model,
+        rotation: int,
+        model_lock: threading.Lock,
+    ) -> None:
+        super().__init__()
+        self.index      = index
+        self.path       = path
+        self.model      = model
+        self.rotation   = rotation
+        self.model_lock = model_lock
+        self.signals    = _BatchWorkerSignals()
+        self.setAutoDelete(True)
+
+    def run(self) -> None:
+        result = _infer_image_batch(self.path, self.model, self.rotation, self.model_lock)
+        self.signals.result.emit(self.index, result)
+
+
+# ---------------------------------------------------------------------------
+# Batch Report Dialog
+# ---------------------------------------------------------------------------
+
+class BatchReportDialog(QDialog):
+    """
+    Shown after a batch run over a folder of images.
+
+    Phase 1 (progress):  live progress bar while images are processed.
+    Phase 2 (report):    summary stats + per-image scrollable table + CSV export.
+    """
+
+    _STATUS_COLOURS: dict[str, tuple[str, str]] = {
+        "Valid":         ("#1f4d38", "#e8fff1"),
+        "Partial":       ("#5a3d12", "#fff1d6"),
+        "No Detection":  ("#5a2020", "#ffe1e1"),
+        "Error":         ("#5a2020", "#ffe1e1"),
+    }
+
+    def __init__(self, total_images: int, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Batch Read")
+        self.setModal(True)
+        self.resize(1000, 720)
+        self.setStyleSheet(_theme_stylesheet())
+
+        self._total = total_images
+        self._results: list[dict] = []       # filled via add_result()
+        self._folder_path: str = ""
+
+        self._build_ui()
+        self._show_progress_phase()
+
+    # ------------------------------------------------------------------
+    # UI construction
+    # ------------------------------------------------------------------
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(22, 18, 22, 18)
+        layout.setSpacing(12)
+
+        # ── Title ───────────────────────────────────────────────────────
+        self._title_label = QLabel("Batch Read in Progress…")
+        self._title_label.setObjectName("titleLabel")
+        self._title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self._title_label)
+
+        # ── Subtitle ────────────────────────────────────────────────────
+        self._sub_label = QLabel("")
+        self._sub_label.setObjectName("subtitleLabel")
+        self._sub_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self._sub_label)
+
+        # ── Progress bar (shown during phase 1) ─────────────────────────
+        self._progress_bar = QProgressBar()
+        self._progress_bar.setRange(0, max(self._total, 1))
+        self._progress_bar.setValue(0)
+        self._progress_bar.setTextVisible(True)
+        self._progress_bar.setFixedHeight(20)
+        layout.addWidget(self._progress_bar)
+
+        # ── Summary stats row (shown during phase 2) ─────────────────────
+        self._summary_widget = QWidget()
+        summary_layout = QHBoxLayout(self._summary_widget)
+        summary_layout.setContentsMargins(0, 0, 0, 0)
+        summary_layout.setSpacing(10)
+
+        self._stat_labels: dict[str, QLabel] = {}
+        for key in ("Total", "Valid", "Partial", "No Detection", "Error"):
+            box = QGroupBox(key)
+            box_layout = QVBoxLayout(box)
+            box_layout.setContentsMargins(10, 10, 10, 10)
+            lbl = QLabel("0")
+            lbl.setObjectName("metaValue")
+            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            pct = QLabel("--")
+            pct.setObjectName("subtitleLabel")
+            pct.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            box_layout.addWidget(lbl)
+            box_layout.addWidget(pct)
+            summary_layout.addWidget(box)
+            self._stat_labels[key] = lbl
+            self._stat_labels[key + "_pct"] = pct
+
+        layout.addWidget(self._summary_widget)
+
+        # ── Per-image table ──────────────────────────────────────────────
+        self._table = QTableWidget()
+        self._table.setColumnCount(7)
+        self._table.setHorizontalHeaderLabels([
+            "#", "Filename", "Reading", "Status",
+            "Strip Conf", "Digits Found", "Source Window",
+        ])
+        self._table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self._table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self._table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self._table.setAlternatingRowColors(True)
+        self._table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self._table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self._table.verticalHeader().setVisible(False)
+        self._table.setStyleSheet(
+            "QTableWidget { background: #0f1319; alternate-background-color: #141a22; "
+            "gridline-color: #2a3440; border: 1px solid #2d3744; border-radius: 10px; }"
+            "QHeaderView::section { background: #1b2129; color: #9fb2c8; "
+            "padding: 6px; border: none; font-weight: 600; }"
+        )
+        layout.addWidget(self._table, stretch=1)
+
+        # ── Bottom row: export + close ───────────────────────────────────
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(10)
+        self._btn_export = QPushButton("Export CSV")
+        self._btn_export.setEnabled(False)
+        self._btn_close = QPushButton("Close")
+        self._btn_close.clicked.connect(self.accept)
+        self._btn_export.clicked.connect(self._export_csv)
+        btn_row.addStretch()
+        btn_row.addWidget(self._btn_export)
+        btn_row.addWidget(self._btn_close)
+        layout.addLayout(btn_row)
+
+    # ------------------------------------------------------------------
+    # Phase helpers
+    # ------------------------------------------------------------------
+
+    def _show_progress_phase(self) -> None:
+        self._summary_widget.setVisible(False)
+        self._table.setVisible(False)
+        self._btn_export.setVisible(False)
+        self._progress_bar.setVisible(True)
+
+    def _show_report_phase(self) -> None:
+        self._progress_bar.setVisible(False)
+        self._summary_widget.setVisible(True)
+        self._table.setVisible(True)
+        self._btn_export.setVisible(True)
+
+    # ------------------------------------------------------------------
+    # Public API — called from the main window while processing
+    # ------------------------------------------------------------------
+
+    def set_folder(self, folder_path: str) -> None:
+        self._folder_path = folder_path
+
+    def update_progress(self, done: int, filename: str) -> None:
+        """Called from the main thread each time a worker emits its result."""
+        self._progress_bar.setValue(done)
+        self._sub_label.setText(
+            f"Completed {done} / {self._total}  —  last finished: {filename}"
+        )
+        QApplication.processEvents()
+
+    def add_result(self, result: dict) -> None:
+        """
+        result keys expected:
+          filename, reading, status, strip_conf, digit_count,
+          window_index, total_windows, error (optional)
+        """
+        self._results.append(result)
+
+    def finish(self) -> None:
+        """Switch to the report phase and populate summary + table."""
+        self._title_label.setText("Batch Read Complete")
+        self._title_label.setStyleSheet(
+            "font-size: 18pt; font-weight: 700; color: #22c55e;"
+        )
+
+        total = len(self._results)
+        counts: dict[str, int] = {
+            "Valid": 0, "Partial": 0, "No Detection": 0, "Error": 0,
+        }
+        for r in self._results:
+            status = r.get("status", "Error")
+            if status in counts:
+                counts[status] += 1
+            else:
+                counts["Error"] += 1
+
+        # ── Update summary stats ─────────────────────────────────────────
+        self._stat_labels["Total"].setText(str(total))
+        self._stat_labels["Total_pct"].setText("100%")
+        for key in ("Valid", "Partial", "No Detection", "Error"):
+            n = counts[key]
+            pct = (n / total * 100) if total else 0.0
+            self._stat_labels[key].setText(str(n))
+            self._stat_labels[key + "_pct"].setText(f"{pct:.1f}%")
+
+        valid_pct = (counts["Valid"] / total * 100) if total else 0.0
+        self._sub_label.setText(
+            f"{total} image(s) processed  —  "
+            f"Success rate: {valid_pct:.1f}%  "
+            f"({counts['Valid']} valid / {counts['Partial']} partial / "
+            f"{counts['No Detection']} no-det / {counts['Error']} error)"
+        )
+
+        # ── Populate table ───────────────────────────────────────────────
+        self._table.setRowCount(len(self._results))
+        for row, r in enumerate(self._results):
+            status = r.get("status", "Error")
+            bg, fg = self._STATUS_COLOURS.get(status, ("#2a3440", "#dfe8f2"))
+
+            cells = [
+                str(row + 1),
+                r.get("filename", ""),
+                r.get("reading", "-----"),
+                status,
+                r.get("strip_conf", "--"),
+                r.get("digit_count", "--"),
+                r.get("window_label", "--"),
+            ]
+            for col, text in enumerate(cells):
+                item = QTableWidgetItem(str(text))
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                if col == 3:          # Status column — colour-coded
+                    item.setBackground(QColor(bg))
+                    item.setForeground(QColor(fg))
+                if col == 1:          # Filename — left-aligned
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+                self._table.setItem(row, col, item)
+
+        self._table.resizeColumnToContents(0)
+        self._table.resizeColumnToContents(4)
+        self._table.resizeColumnToContents(5)
+        self._table.resizeColumnToContents(6)
+
+        self._btn_export.setEnabled(bool(self._results))
+        self._show_report_phase()
+        QApplication.processEvents()
+
+    # ------------------------------------------------------------------
+    # CSV Export
+    # ------------------------------------------------------------------
+
+    def _export_csv(self) -> None:
+        import csv as _csv
+
+        default_name = "batch_report.csv"
+        default_dir = self._folder_path if self._folder_path else str(Path.cwd())
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Batch Report", str(Path(default_dir) / default_name),
+            "CSV Files (*.csv)"
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                writer = _csv.writer(f)
+                writer.writerow([
+                    "#", "Filename", "Reading", "Status",
+                    "Strip Conf", "Digits Found", "Source Window",
+                ])
+                for i, r in enumerate(self._results, start=1):
+                    writer.writerow([
+                        i,
+                        r.get("filename", ""),
+                        r.get("reading", ""),
+                        r.get("status", ""),
+                        r.get("strip_conf", ""),
+                        r.get("digit_count", ""),
+                        r.get("window_label", ""),
+                    ])
+            self.parent().statusBar().showMessage(f"Report exported: {Path(path).name}") if self.parent() else None
+        except Exception as exc:
+            self._sub_label.setText(f"Export failed: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Image viewer widget
+# ---------------------------------------------------------------------------
 
 class _ImageViewer(QGraphicsView):
     def __init__(self):
@@ -549,6 +1217,10 @@ class _ImageViewer(QGraphicsView):
         self._zoom = max(0.05, min(self._zoom * factor, 50.0))
 
 
+# ---------------------------------------------------------------------------
+# Main application window
+# ---------------------------------------------------------------------------
+
 class YoloTesterWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -563,6 +1235,11 @@ class YoloTesterWindow(QMainWindow):
         self._raw_cv: np.ndarray | None = None
         self._annotated_cv: np.ndarray | None = None
         self._annotated_is_rotated = False
+
+        # Persistent settings — remember last-used directories across restarts
+        self._settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
+        self._last_image_dir = self._read_existing_dir_setting(SETTINGS_LAST_IMAGE_DIR)
+        self._last_model_dir = self._read_existing_dir_setting(SETTINGS_LAST_MODEL_DIR)
 
         self._build_ui()
         self._wire_signals()
@@ -583,7 +1260,7 @@ class YoloTesterWindow(QMainWindow):
         title = QLabel("YOLO Meter Reader Tester")
         title.setObjectName("titleLabel")
         subtitle = QLabel(
-            "Windowed 640x640 scanning for full-resolution images, with strip-local digit decoding."
+            "Windowed 640×640 scanning for full-resolution images, with strip-local digit decoding."
         )
         subtitle.setObjectName("subtitleLabel")
         hero_layout.addWidget(title)
@@ -635,10 +1312,18 @@ class YoloTesterWindow(QMainWindow):
         results_layout = QVBoxLayout(results_group)
         results_layout.setSpacing(12)
 
+        read_btn_row = QHBoxLayout()
+        read_btn_row.setSpacing(8)
         self._btn_read = QPushButton("Run Read")
         self._btn_read.setFixedHeight(48)
         self._btn_read.setEnabled(False)
-        results_layout.addWidget(self._btn_read)
+        self._btn_batch = QPushButton("Batch Read All")
+        self._btn_batch.setFixedHeight(48)
+        self._btn_batch.setEnabled(False)
+        self._btn_batch.setToolTip("Run inference on every image in the loaded folder and generate a report.")
+        read_btn_row.addWidget(self._btn_read)
+        read_btn_row.addWidget(self._btn_batch)
+        results_layout.addLayout(read_btn_row)
 
         self._lbl_status = QLabel("Idle")
         self._lbl_status.setObjectName("statusBadge")
@@ -706,6 +1391,7 @@ class YoloTesterWindow(QMainWindow):
         self._btn_fit.clicked.connect(self._viewer.fit)
         self._btn_model.clicked.connect(self._select_model)
         self._btn_read.clicked.connect(self._run_read)
+        self._btn_batch.clicked.connect(self._run_batch_read)
         self._btn_rotate_left.clicked.connect(self._rotate_left)
         self._btn_rotate_right.clicked.connect(self._rotate_right)
 
@@ -737,12 +1423,40 @@ class YoloTesterWindow(QMainWindow):
             f"background: {background}; color: {foreground}; font-weight: 700; border-radius: 12px; padding: 6px 12px;"
         )
 
+    # ------------------------------------------------------------------
+    # Settings helpers (mirrors main.py pattern)
+    # ------------------------------------------------------------------
+
+    def _read_existing_dir_setting(self, key: str) -> str:
+        value = str(self._settings.value(key, "", type=str) or "")
+        return value if value and Path(value).exists() else ""
+
+    def _pick_directory(self, title: str, start_dir: str = "") -> str:
+        dialog = QFileDialog(self, title)
+        dialog.setFileMode(QFileDialog.FileMode.Directory)
+        dialog.setOption(QFileDialog.Option.ShowDirsOnly, True)
+        dialog.setOption(QFileDialog.Option.DontUseNativeDialog, True)
+        base_dir = start_dir if start_dir and Path(start_dir).exists() else str(Path.cwd())
+        dialog.setDirectory(base_dir)
+        if dialog.exec() != QFileDialog.DialogCode.Accepted:
+            return ""
+        selected = dialog.selectedFiles()
+        return selected[0] if selected else ""
+
+    # ------------------------------------------------------------------
+
     def _open_folder(self) -> None:
-        folder = QFileDialog.getExistingDirectory(self, "Select Image Folder")
+        folder = self._pick_directory("Select Image Folder", self._last_image_dir)
         if not folder:
             return
+        self._last_image_dir = folder
+        self._settings.setValue(SETTINGS_LAST_IMAGE_DIR, folder)
         paths = sorted(
-            (path for path in Path(folder).iterdir() if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS),
+            (
+                path
+                for path in Path(folder).iterdir()
+                if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+            ),
             key=lambda path: path.name.lower(),
         )
         if not paths:
@@ -758,7 +1472,8 @@ class YoloTesterWindow(QMainWindow):
         if not self._images or self._idx < 0:
             return
         path = self._images[self._idx]
-        image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+        # Use read_image_any so HEIC/HEIF files are handled via pillow-heif
+        image = read_image_any(str(path))
         if image is None:
             self.statusBar().showMessage(f"Cannot read: {path.name}")
             return
@@ -815,10 +1530,11 @@ class YoloTesterWindow(QMainWindow):
         if not ULTRALYTICS_AVAILABLE:
             self.statusBar().showMessage("ultralytics not installed - run: pip install ultralytics")
             return
+        start_dir = self._last_model_dir if self._last_model_dir else self._last_image_dir
         path, _ = QFileDialog.getOpenFileName(
             self,
             "Select YOLOv8 Model",
-            "",
+            start_dir,
             "PyTorch Model (*.pt)",
         )
         if not path:
@@ -827,6 +1543,10 @@ class YoloTesterWindow(QMainWindow):
             self._model = YOLO(path)
             self._lbl_model.setText(f"Model: {Path(path).name}")
             self.statusBar().showMessage(f"Model loaded: {Path(path).name}")
+            # Remember the folder this model came from
+            model_dir = str(Path(path).parent)
+            self._last_model_dir = model_dir
+            self._settings.setValue(SETTINGS_LAST_MODEL_DIR, model_dir)
         except Exception as exc:
             self._model = None
             self._lbl_model.setText("Failed to load model")
@@ -834,42 +1554,210 @@ class YoloTesterWindow(QMainWindow):
             self._set_status_badge("Error")
         self._refresh_controls()
 
-    def _infer_windows(self, image: np.ndarray) -> tuple[dict | None, list[dict]]:
+    # ------------------------------------------------------------------
+    # Inference pipeline (with optional live-preview callback)
+    # ------------------------------------------------------------------
+
+    def _infer_windows(
+        self,
+        image: np.ndarray,
+        preview: ProcessPreviewDialog | None = None,
+    ) -> tuple[dict | None, list[dict]]:
         windows = build_sliding_windows(image.shape[1], image.shape[0])
         if not windows:
             return None, []
 
-        candidates: list[dict] = []
-        best_candidate: dict | None = None
         total_windows = len(windows)
 
+        # ── Frame 0: show the full source image ──────────────────────────
+        if preview:
+            preview.push_frame(
+                "Original Image",
+                image,
+                subtitle=f"Image size: {image.shape[1]}×{image.shape[0]} px  —  {total_windows} window(s) to scan",
+                progress=0.0,
+                window_text=f"0 / {total_windows} windows scanned",
+                accent_key="original",
+            )
+
+        candidates: list[dict] = []
+        best_candidate: dict | None = None
+
         for idx, window in enumerate(windows, start=1):
+            base_progress = (idx - 1) / total_windows
+
+            # ── Frame A: highlight the current sampling window ────────────
+            if preview:
+                overlay = image.copy()
+                # Dim everything outside the window
+                dim = (image * 0.25).astype(np.uint8)
+                combined = dim.copy()
+                wy1 = max(window.y, 0)
+                wy2 = min(window.y + window.size, image.shape[0])
+                wx1 = max(window.x, 0)
+                wx2 = min(window.x + window.size, image.shape[1])
+                combined[wy1:wy2, wx1:wx2] = image[wy1:wy2, wx1:wx2]
+                # Bright border around the active window
+                cv2.rectangle(
+                    combined,
+                    (window.x, window.y),
+                    (window.x + window.size, window.y + window.size),
+                    (0, 200, 255), 3,
+                )
+                # Corner label
+                cv2.putText(
+                    combined,
+                    f"W{idx}/{total_windows}",
+                    (window.x + 6, window.y + 26),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 255), 2, cv2.LINE_AA,
+                )
+                preview.push_frame(
+                    f"Sampling — Window {idx} / {total_windows}",
+                    combined,
+                    subtitle=f"Crop at  x={window.x},  y={window.y},  size={window.size}×{window.size}",
+                    progress=base_progress + 0.1 / total_windows,
+                    window_text=f"Window {idx} of {total_windows}",
+                    accent_key="sampling",
+                )
+
             crop = image[window.y:window.y + window.size, window.x:window.x + window.size]
             if crop.size == 0:
                 continue
+
+            # ── Frame B: raw crop extracted ───────────────────────────────
+            if preview:
+                preview.push_frame(
+                    f"Crop Extracted — Window {idx} / {total_windows}",
+                    crop,
+                    subtitle=f"{window.size}×{window.size} px region isolated",
+                    progress=base_progress + 0.25 / total_windows,
+                    window_text=f"Window {idx} of {total_windows}",
+                    accent_key="crop",
+                )
+
             resized = cv2.resize(crop, (MODEL_IMAGE_SIZE, MODEL_IMAGE_SIZE), interpolation=cv2.INTER_AREA)
-            # Convert to 3-channel grayscale for inference so the input
-            # colour-space matches what the model was trained on.
-            _gray    = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
-            _infer   = cv2.cvtColor(_gray,   cv2.COLOR_GRAY2BGR)
+
+            # Convert to 3-channel greyscale for inference
+            _gray  = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+            _infer = cv2.cvtColor(_gray,   cv2.COLOR_GRAY2BGR)
+
+            # ── Frame C: greyscale preprocessing ─────────────────────────
+            if preview:
+                preview.push_frame(
+                    f"Preprocessing — Window {idx} / {total_windows}",
+                    _infer,
+                    subtitle=f"Resized to {MODEL_IMAGE_SIZE}×{MODEL_IMAGE_SIZE}  →  greyscale  →  3-channel",
+                    progress=base_progress + 0.45 / total_windows,
+                    window_text=f"Window {idx} of {total_windows}",
+                    accent_key="preprocess",
+                )
+
+            # ── Frame D: inference running ────────────────────────────────
+            if preview:
+                preview.push_frame(
+                    f"Running Inference — Window {idx} / {total_windows}",
+                    _infer,
+                    subtitle="YOLO model scanning for strip + digits…",
+                    progress=base_progress + 0.55 / total_windows,
+                    window_text=f"Window {idx} of {total_windows}",
+                    accent_key="inference",
+                )
+
             results = self._model.predict(  # type: ignore[union-attr]
                 source=_infer,
                 imgsz=MODEL_IMAGE_SIZE,
                 verbose=False,
             )
-            if not results:
-                dets = []
-            else:
-                dets = _parse_result_detections(results[0], window)
+            dets = [] if not results else _parse_result_detections(results[0], window)
+
+            # ── Frame E: show detections mapped onto the crop ─────────────
+            if preview:
+                if dets:
+                    det_vis = _infer.copy()
+                    scale = MODEL_IMAGE_SIZE / float(window.size)
+                    for det in dets:
+                        dx1 = int((det["box"][0] - window.x) * scale)
+                        dy1 = int((det["box"][1] - window.y) * scale)
+                        dx2 = int((det["box"][2] - window.x) * scale)
+                        dy2 = int((det["box"][3] - window.y) * scale)
+                        cls_id = det["cls"]
+                        if cls_id == STRIP_CLASS_ID:
+                            col = _COL_STRIP
+                        elif cls_id == UNREADABLE_CLS:
+                            col = _COL_UNREAD
+                        else:
+                            col = _COL_DIGIT
+                        cv2.rectangle(det_vis, (dx1, dy1), (dx2, dy2), col, 2)
+                        cv2.putText(
+                            det_vis, det["label"],
+                            (dx1 + 2, max(12, dy1 - 4)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 1, cv2.LINE_AA,
+                        )
+                    det_subtitle = f"{len(dets)} detection(s)  —  strip={'yes' if any(d['cls'] == STRIP_CLASS_ID for d in dets) else 'no'}"
+                else:
+                    det_vis = _infer.copy()
+                    cv2.putText(
+                        det_vis, "No detections", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (100, 100, 100), 2, cv2.LINE_AA,
+                    )
+                    det_subtitle = "No detections in this window"
+
+                preview.push_frame(
+                    f"Detections — Window {idx} / {total_windows}",
+                    det_vis,
+                    subtitle=det_subtitle,
+                    progress=base_progress + 0.85 / total_windows,
+                    window_text=f"Window {idx} of {total_windows}",
+                    accent_key="detections",
+                )
 
             candidate = _evaluate_window_candidate(dets, idx, total_windows, window)
             candidates.append(candidate)
-            if candidate["valid"]:
-                return candidate, candidates
+
             if best_candidate is None or _candidate_rank(candidate) > _candidate_rank(best_candidate):
                 best_candidate = candidate
 
+            # Valid hit — show annotated full image and exit early
+            if candidate["valid"]:
+                if preview:
+                    final_vis = _draw_detections(
+                        image,
+                        candidate["all_dets"],
+                        selected_strip=candidate["strip_det"],
+                        selected_digits=candidate["digit_dets"],
+                    )
+                    preview.push_frame(
+                        "✓  Valid Reading Found!",
+                        final_vis,
+                        subtitle=f"Reading: {candidate['reading']}  |  Strip: {candidate['strip_conf']:.0%}  |  Digits: {candidate['digit_count']}/{NUM_DIGITS}",
+                        progress=1.0,
+                        window_text=f"Window {idx} of {total_windows}  —  early exit",
+                        accent_key="result",
+                    )
+                return candidate, candidates
+
+        # ── All windows scanned — show best candidate ────────────────────
+        if preview and best_candidate is not None:
+            final_vis = _draw_detections(
+                image,
+                best_candidate["all_dets"],
+                selected_strip=best_candidate["strip_det"],
+                selected_digits=best_candidate["digit_dets"],
+            )
+            preview.push_frame(
+                "Best Candidate Selected",
+                final_vis,
+                subtitle=f"Reading: {best_candidate['reading']}  |  Status: {best_candidate['status']}",
+                progress=1.0,
+                window_text=f"All {total_windows} window(s) scanned",
+                accent_key="result",
+            )
+
         return best_candidate, candidates
+
+    # ------------------------------------------------------------------
+    # Result UI update
+    # ------------------------------------------------------------------
 
     def _update_result_ui(self, candidate: dict | None, scanned_windows: int, total_windows: int) -> None:
         if candidate is None:
@@ -914,34 +1802,108 @@ class YoloTesterWindow(QMainWindow):
             f"{candidate['status']}: {candidate['reading']} | digits {candidate['digit_count']}/{NUM_DIGITS} | window {candidate['window_index']}/{candidate['total_windows']}"
         )
 
+    # ------------------------------------------------------------------
+    # Run Read — opens process preview, runs inference, closes on finish
+    # ------------------------------------------------------------------
+
     def _run_read(self) -> None:
         if self._model is None or self._raw_cv is None:
             return
 
         visible_image = _rotate_cv(self._raw_cv, self._rotation)
         self._set_status_badge("Scanning")
-        self._lbl_detail.setText("Running center-first 640x640 window scan...")
-        self.statusBar().showMessage("Running center-first 640x640 window scan...")
+        self._lbl_detail.setText("Running center-first 640×640 window scan…")
+        self.statusBar().showMessage("Running center-first 640×640 window scan…")
+        QApplication.processEvents()
+
+        # Open the timelapse process-preview dialog
+        preview = ProcessPreviewDialog(self)
+        preview.show()
         QApplication.processEvents()
 
         try:
-            best_candidate, candidates = self._infer_windows(visible_image)
+            best_candidate, candidates = self._infer_windows(visible_image, preview=preview)
         except Exception as exc:
+            preview.close()
             self._set_status_badge("Error")
             self._lbl_detail.setText(f"Inference error: {exc}")
             self.statusBar().showMessage(f"Inference error: {exc}")
             return
 
+        # Trigger the auto-close countdown on the preview
+        preview.finish(delay_ms=2000)
+
         total_windows = len(build_sliding_windows(visible_image.shape[1], visible_image.shape[0]))
         scanned_windows = len(candidates)
         self._update_result_ui(best_candidate, scanned_windows, total_windows)
 
+    # ------------------------------------------------------------------
+    # Batch Read — dispatch all images to QThreadPool, collect via signals
+    # ------------------------------------------------------------------
+
+    def _run_batch_read(self) -> None:
+        if self._model is None or not self._images:
+            return
+
+        total        = len(self._images)
+        folder_str   = str(self._images[0].parent)
+        model_lock   = threading.Lock()   # serialises model.predict() calls
+
+        report_dialog = BatchReportDialog(total, self)
+        report_dialog.set_folder(folder_str)
+        report_dialog.show()
+        QApplication.processEvents()
+
+        self._btn_batch.setEnabled(False)
+        self._btn_read.setEnabled(False)
+
+        # Preallocate slots so results are stored in original folder order
+        results_store: list[dict | None] = [None] * total
+        completed      = [0]   # mutable counter (closure-friendly)
+
+        def _on_result(index: int, result: dict) -> None:
+            """Slot — always called on the main thread via Qt's queued connection."""
+            results_store[index] = result
+            completed[0] += 1
+            report_dialog.update_progress(completed[0], result.get("filename", ""))
+
+            if completed[0] == total:
+                # All workers done — add results in original order then show report
+                for r in results_store:
+                    if r is not None:
+                        report_dialog.add_result(r)
+                report_dialog.finish()
+                self._btn_batch.setEnabled(True)
+                self._btn_read.setEnabled(True)
+                self.statusBar().showMessage(
+                    f"Batch read complete — {total} image(s) processed."
+                )
+
+        # Use QThreadPool with a sensible thread cap:
+        #   • enough threads to overlap I/O + preprocessing
+        #   • not so many that we thrash CPU or VRAM
+        pool = QThreadPool.globalInstance()
+        thread_cap = max(2, min(pool.maxThreadCount(), 6))
+        pool.setMaxThreadCount(thread_cap)
+
+        for idx, path in enumerate(self._images):
+            worker = BatchImageWorker(idx, path, self._model, self._rotation, model_lock)
+            # Qt queued connection ensures _on_result runs on the main thread
+            worker.signals.result.connect(_on_result, Qt.ConnectionType.QueuedConnection)
+            pool.start(worker)
+
     def _refresh_controls(self) -> None:
         has_images = bool(self._images)
+        has_model = self._model is not None
         self._btn_prev.setEnabled(has_images and self._idx > 0)
         self._btn_next.setEnabled(has_images and self._idx < len(self._images) - 1)
-        self._btn_read.setEnabled(has_images and self._model is not None)
+        self._btn_read.setEnabled(has_images and has_model)
+        self._btn_batch.setEnabled(has_images and has_model)
 
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 def main() -> None:
     if not ULTRALYTICS_AVAILABLE:
