@@ -32,14 +32,19 @@ from PyQt6.QtGui import (
     QFont,
     QImage,
     QKeySequence,
+    QMouseEvent,
     QPainter,
+    QPen,
     QPixmap,
     QShortcut,
     QWheelEvent,
 )
 from PyQt6.QtWidgets import (
     QApplication,
+    QCheckBox,
+    QComboBox,
     QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QGraphicsPixmapItem,
     QGraphicsScene,
@@ -48,8 +53,11 @@ from PyQt6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
+    QLineEdit,
     QMainWindow,
+    QMessageBox,
     QProgressBar,
     QPushButton,
     QScrollArea,
@@ -62,6 +70,15 @@ from PyQt6.QtWidgets import (
 )
 
 from auto_read_pipeline import SlidingWindow, build_sliding_windows
+from yolo_review_backend import (
+    CLASS_NAMES,
+    ReviewStore,
+    build_reading_from_detections,
+    char_to_class_id,
+    class_id_to_char,
+    normalize_box,
+    sanitize_brand,
+)
 
 try:
     from ultralytics import YOLO
@@ -229,6 +246,28 @@ def _style_name(cls_id: int) -> str:
     if _is_digit_class(cls_id):
         return f"Digit {_digit_char(cls_id)}"
     return f"Class {cls_id}"
+
+
+def _clone_detection(det: dict | None) -> dict | None:
+    if det is None:
+        return None
+    cloned = dict(det)
+    cloned["box"] = list(det["box"])
+    return cloned
+
+
+def _clone_detection_list(detections: list[dict] | None) -> list[dict]:
+    return [_clone_detection(det) for det in (detections or []) if det is not None]
+
+
+def _selected_review_detections(candidate: dict | None) -> list[dict]:
+    if candidate is None:
+        return []
+    detections: list[dict] = []
+    if candidate.get("strip_det") is not None:
+        detections.append(_clone_detection(candidate["strip_det"]))
+    detections.extend(_clone_detection_list(candidate.get("digit_dets", [])))
+    return [det for det in detections if det is not None]
 
 
 def _draw_detections(
@@ -902,6 +941,7 @@ class BatchImageWorker(QRunnable):
 # ---------------------------------------------------------------------------
 
 class BatchReportDialog(QDialog):
+    open_image_requested = pyqtSignal(str)
     """
     Shown after a batch run over a folder of images.
 
@@ -926,6 +966,7 @@ class BatchReportDialog(QDialog):
         self._total = total_images
         self._results: list[dict] = []       # filled via add_result()
         self._folder_path: str = ""
+        self._review_lookup: dict[str, dict] = {}
 
         self._build_ui()
         self._show_progress_phase()
@@ -983,13 +1024,25 @@ class BatchReportDialog(QDialog):
             self._stat_labels[key + "_pct"] = pct
 
         layout.addWidget(self._summary_widget)
+        filter_row = QHBoxLayout()
+        filter_row.setSpacing(10)
+        filter_row.addWidget(QLabel("Status Filter"))
+        self._status_filter = QComboBox()
+        self._status_filter.addItems(["All", "Valid", "Partial", "No Detection", "Error"])
+        filter_row.addWidget(self._status_filter)
+        filter_row.addWidget(QLabel("Review Filter"))
+        self._review_filter = QComboBox()
+        self._review_filter.addItems(["All", "Unreviewed", "marked_correct", "reading_only", "detection_fixed", "unreadable_or_skip"])
+        filter_row.addWidget(self._review_filter)
+        filter_row.addStretch(1)
+        layout.addLayout(filter_row)
 
         # ── Per-image table ──────────────────────────────────────────────
         self._table = QTableWidget()
-        self._table.setColumnCount(7)
+        self._table.setColumnCount(8)
         self._table.setHorizontalHeaderLabels([
             "#", "Filename", "Reading", "Status",
-            "Strip Conf", "Digits Found", "Source Window",
+            "Strip Conf", "Digits Found", "Source Window", "Review State",
         ])
         self._table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self._table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
@@ -1018,6 +1071,9 @@ class BatchReportDialog(QDialog):
         btn_row.addWidget(self._btn_export)
         btn_row.addWidget(self._btn_close)
         layout.addLayout(btn_row)
+        self._status_filter.currentTextChanged.connect(self._apply_filters)
+        self._review_filter.currentTextChanged.connect(self._apply_filters)
+        self._table.cellDoubleClicked.connect(self._handle_row_open)
 
     # ------------------------------------------------------------------
     # Phase helpers
@@ -1041,6 +1097,9 @@ class BatchReportDialog(QDialog):
 
     def set_folder(self, folder_path: str) -> None:
         self._folder_path = folder_path
+
+    def set_review_lookup(self, review_lookup: dict[str, dict]) -> None:
+        self._review_lookup = dict(review_lookup)
 
     def update_progress(self, done: int, filename: str) -> None:
         """Called from the main thread each time a worker emits its result."""
@@ -1098,6 +1157,10 @@ class BatchReportDialog(QDialog):
         for row, r in enumerate(self._results):
             status = r.get("status", "Error")
             bg, fg = self._STATUS_COLOURS.get(status, ("#2a3440", "#dfe8f2"))
+            image_path = str(Path(self._folder_path) / str(r.get("filename", "")))
+            review = self._review_lookup.get(image_path)
+            review_state = str(review.get("review_type", "Unreviewed")) if review else "Unreviewed"
+            r["review_state"] = review_state
 
             cells = [
                 str(row + 1),
@@ -1107,6 +1170,7 @@ class BatchReportDialog(QDialog):
                 r.get("strip_conf", "--"),
                 r.get("digit_count", "--"),
                 r.get("window_label", "--"),
+                review_state,
             ]
             for col, text in enumerate(cells):
                 item = QTableWidgetItem(str(text))
@@ -1122,10 +1186,28 @@ class BatchReportDialog(QDialog):
         self._table.resizeColumnToContents(4)
         self._table.resizeColumnToContents(5)
         self._table.resizeColumnToContents(6)
+        self._table.resizeColumnToContents(7)
 
         self._btn_export.setEnabled(bool(self._results))
         self._show_report_phase()
+        self._apply_filters()
         QApplication.processEvents()
+
+    def _apply_filters(self) -> None:
+        status_filter = self._status_filter.currentText()
+        review_filter = self._review_filter.currentText()
+        for row, result in enumerate(self._results):
+            status_ok = status_filter == "All" or str(result.get("status", "")) == status_filter
+            review_state = str(result.get("review_state", "Unreviewed"))
+            review_ok = review_filter == "All" or review_state == review_filter
+            self._table.setRowHidden(row, not (status_ok and review_ok))
+
+    def _handle_row_open(self, row: int, _column: int) -> None:
+        if row < 0 or row >= len(self._results):
+            return
+        filename = str(self._results[row].get("filename", ""))
+        if filename:
+            self.open_image_requested.emit(filename)
 
     # ------------------------------------------------------------------
     # CSV Export
@@ -1147,7 +1229,7 @@ class BatchReportDialog(QDialog):
                 writer = _csv.writer(f)
                 writer.writerow([
                     "#", "Filename", "Reading", "Status",
-                    "Strip Conf", "Digits Found", "Source Window",
+                    "Strip Conf", "Digits Found", "Source Window", "Review State",
                 ])
                 for i, r in enumerate(self._results, start=1):
                     writer.writerow([
@@ -1158,10 +1240,402 @@ class BatchReportDialog(QDialog):
                         r.get("strip_conf", ""),
                         r.get("digit_count", ""),
                         r.get("window_label", ""),
+                        r.get("review_state", "Unreviewed"),
                     ])
             self.parent().statusBar().showMessage(f"Report exported: {Path(path).name}") if self.parent() else None
         except Exception as exc:
             self._sub_label.setText(f"Export failed: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Review / correction dialogs
+# ---------------------------------------------------------------------------
+
+class ExportReviewsDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Export Reviewed Cases")
+        self.setModal(True)
+        self.resize(420, 170)
+        self.setStyleSheet(_theme_stylesheet())
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(12)
+
+        layout.addWidget(QLabel("Brand filter"))
+        self._brand_combo = QComboBox()
+        self._brand_combo.setEditable(True)
+        self._brand_combo.addItems(["", "AsiaM", "Maxwinner", "Unknown"])
+        self._brand_combo.setCurrentText("")
+        layout.addWidget(self._brand_combo)
+
+        self._include_correct = QCheckBox("Include 'marked correct' reviews")
+        self._include_correct.setChecked(False)
+        layout.addWidget(self._include_correct)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def values(self) -> tuple[str, bool]:
+        return self._brand_combo.currentText().strip(), self._include_correct.isChecked()
+
+
+class DetectionAnnotationCanvas(QWidget):
+    selection_changed = pyqtSignal(int)
+    boxes_changed = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumSize(760, 460)
+        self._image: np.ndarray | None = None
+        self._boxes: list[dict] = []
+        self._selected_index = -1
+        self._mode = "select"
+        self._draft_start: tuple[int, int] | None = None
+        self._draft_end: tuple[int, int] | None = None
+        self._pending_class_id = DIGIT_OFFSET
+        self._moving = False
+        self._move_offset = (0, 0)
+
+    def set_image(self, image_bgr: np.ndarray) -> None:
+        self._image = image_bgr.copy()
+        self.update()
+
+    def set_boxes(self, boxes: list[dict]) -> None:
+        self._boxes = _clone_detection_list(boxes)
+        self._selected_index = -1
+        self.selection_changed.emit(-1)
+        self.boxes_changed.emit()
+        self.update()
+
+    def boxes(self) -> list[dict]:
+        return _clone_detection_list(self._boxes)
+
+    def selected_index(self) -> int:
+        return self._selected_index
+
+    def selected_box(self) -> dict | None:
+        if 0 <= self._selected_index < len(self._boxes):
+            return self._boxes[self._selected_index]
+        return None
+
+    def set_mode(self, mode: str) -> None:
+        self._mode = mode
+        self._draft_start = None
+        self._draft_end = None
+        self._moving = False
+        self.update()
+
+    def set_pending_class_id(self, class_id: int) -> None:
+        self._pending_class_id = class_id
+
+    def set_selected_class_id(self, class_id: int) -> None:
+        if 0 <= self._selected_index < len(self._boxes):
+            self._boxes[self._selected_index]["cls"] = class_id
+            self.boxes_changed.emit()
+            self.update()
+
+    def delete_selected(self) -> None:
+        if 0 <= self._selected_index < len(self._boxes):
+            del self._boxes[self._selected_index]
+            self._selected_index = -1
+            self.selection_changed.emit(-1)
+            self.boxes_changed.emit()
+            self.update()
+
+    def _image_rect(self) -> tuple[QRectF, float, float]:
+        if self._image is None:
+            return QRectF(), 1.0, 1.0
+        h, w = self._image.shape[:2]
+        available = self.rect().adjusted(10, 10, -10, -10)
+        if available.width() <= 0 or available.height() <= 0:
+            return QRectF(), 1.0, 1.0
+        scale = min(available.width() / w, available.height() / h)
+        draw_w = w * scale
+        draw_h = h * scale
+        left = available.left() + (available.width() - draw_w) / 2.0
+        top = available.top() + (available.height() - draw_h) / 2.0
+        return QRectF(left, top, draw_w, draw_h), scale, scale
+
+    def _widget_to_image(self, pos) -> tuple[int, int] | None:
+        if self._image is None:
+            return None
+        image_rect, scale_x, scale_y = self._image_rect()
+        if not image_rect.contains(pos):
+            return None
+        x = int((pos.x() - image_rect.left()) / scale_x)
+        y = int((pos.y() - image_rect.top()) / scale_y)
+        return normalize_box([x, y, x + 1, y + 1], self._image.shape[1], self._image.shape[0])[:2]
+
+    def _find_box_at(self, x: int, y: int) -> int:
+        for idx in range(len(self._boxes) - 1, -1, -1):
+            x1, y1, x2, y2 = self._boxes[idx]["box"]
+            if x1 <= x <= x2 and y1 <= y <= y2:
+                return idx
+        return -1
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if self._image is None or event.button() != Qt.MouseButton.LeftButton:
+            return
+        image_pos = self._widget_to_image(event.position())
+        if image_pos is None:
+            return
+        x, y = image_pos
+        hit_index = self._find_box_at(x, y)
+
+        if self._mode == "select":
+            self._selected_index = hit_index
+            self.selection_changed.emit(hit_index)
+            if hit_index >= 0:
+                box = self._boxes[hit_index]["box"]
+                self._moving = True
+                self._move_offset = (x - box[0], y - box[1])
+            self.update()
+            return
+
+        self._selected_index = hit_index if self._mode == "replace" else self._selected_index
+        self.selection_changed.emit(self._selected_index)
+        self._draft_start = (x, y)
+        self._draft_end = (x, y)
+        self.update()
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        if self._image is None:
+            return
+        image_pos = self._widget_to_image(event.position())
+        if image_pos is None:
+            return
+        x, y = image_pos
+        if self._moving and 0 <= self._selected_index < len(self._boxes):
+            box = self._boxes[self._selected_index]["box"]
+            width = box[2] - box[0]
+            height = box[3] - box[1]
+            new_x1 = x - self._move_offset[0]
+            new_y1 = y - self._move_offset[1]
+            self._boxes[self._selected_index]["box"] = normalize_box(
+                [new_x1, new_y1, new_x1 + width, new_y1 + height],
+                self._image.shape[1],
+                self._image.shape[0],
+            )
+            self.boxes_changed.emit()
+            self.update()
+            return
+        if self._draft_start is not None:
+            self._draft_end = (x, y)
+            self.update()
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        if self._image is None or event.button() != Qt.MouseButton.LeftButton:
+            return
+        if self._moving:
+            self._moving = False
+            return
+        if self._draft_start is None or self._draft_end is None:
+            return
+
+        x1 = min(self._draft_start[0], self._draft_end[0])
+        y1 = min(self._draft_start[1], self._draft_end[1])
+        x2 = max(self._draft_start[0], self._draft_end[0])
+        y2 = max(self._draft_start[1], self._draft_end[1])
+        box = normalize_box([x1, y1, x2, y2], self._image.shape[1], self._image.shape[0])
+        if box[2] - box[0] < 5 or box[3] - box[1] < 5:
+            self._draft_start = None
+            self._draft_end = None
+            self.update()
+            return
+
+        class_id = STRIP_CLASS_ID if self._mode == "add_strip" else self._pending_class_id
+        det = {
+            "box": box,
+            "cls": class_id,
+            "conf": 1.0,
+            "label": CLASS_NAMES[class_id] if 0 <= class_id < len(CLASS_NAMES) else f"class_{class_id}",
+        }
+        if self._mode == "replace" and 0 <= self._selected_index < len(self._boxes):
+            self._boxes[self._selected_index] = det
+        else:
+            self._boxes.append(det)
+            self._selected_index = len(self._boxes) - 1
+            self.selection_changed.emit(self._selected_index)
+        self._draft_start = None
+        self._draft_end = None
+        self.boxes_changed.emit()
+        self.update()
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor("#0d1117"))
+        if self._image is None:
+            painter.setPen(QColor("#9fb2c8"))
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "No image")
+            return
+
+        image_rect, scale_x, scale_y = self._image_rect()
+        pix = _cv_to_pixmap(self._image)
+        painter.drawPixmap(image_rect.toRect(), pix)
+
+        def _box_rect(box: list[int]) -> QRectF:
+            return QRectF(
+                image_rect.left() + (box[0] * scale_x),
+                image_rect.top() + (box[1] * scale_y),
+                max((box[2] - box[0]) * scale_x, 1.0),
+                max((box[3] - box[1]) * scale_y, 1.0),
+            )
+
+        for idx, det in enumerate(self._boxes):
+            cls_id = int(det["cls"])
+            if cls_id == STRIP_CLASS_ID:
+                colour = QColor(0, 200, 255)
+            elif cls_id == UNREADABLE_CLS:
+                colour = QColor(60, 60, 230)
+            else:
+                colour = QColor(60, 220, 60)
+            pen = QPen(colour, 3 if idx == self._selected_index else 2)
+            painter.setPen(pen)
+            rect = _box_rect(det["box"])
+            painter.drawRect(rect)
+            painter.fillRect(QRectF(rect.left(), max(rect.top() - 18, image_rect.top()), 120, 18), QColor(20, 20, 20, 220))
+            painter.setPen(QColor("#f3f7fb"))
+            painter.drawText(
+                QRectF(rect.left() + 3, max(rect.top() - 18, image_rect.top()), 116, 18),
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                CLASS_NAMES[cls_id] if 0 <= cls_id < len(CLASS_NAMES) else f"class_{cls_id}",
+            )
+
+        if self._draft_start is not None and self._draft_end is not None:
+            x1 = min(self._draft_start[0], self._draft_end[0])
+            y1 = min(self._draft_start[1], self._draft_end[1])
+            x2 = max(self._draft_start[0], self._draft_end[0])
+            y2 = max(self._draft_start[1], self._draft_end[1])
+            painter.setPen(QPen(QColor("#f59e0b"), 2, Qt.PenStyle.DashLine))
+            painter.drawRect(_box_rect([x1, y1, x2, y2]))
+
+
+class DetectionCorrectionDialog(QDialog):
+    def __init__(self, image_bgr: np.ndarray, detections: list[dict], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Fix Detection")
+        self.setModal(True)
+        self.resize(1180, 760)
+        self.setStyleSheet(_theme_stylesheet())
+        self._result_detections: list[dict] = []
+        self._image = image_bgr.copy()
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(14)
+
+        self._canvas = DetectionAnnotationCanvas()
+        self._canvas.set_image(self._image)
+        self._canvas.set_boxes(detections)
+        layout.addWidget(self._canvas, stretch=3)
+
+        sidebar = QVBoxLayout()
+        sidebar.setSpacing(10)
+        sidebar.addWidget(QLabel("Correction Tools"))
+
+        self._btn_select = QPushButton("Select / Move")
+        self._btn_add_strip = QPushButton("Draw Strip Box")
+        self._btn_add_digit = QPushButton("Draw Digit Box")
+        self._btn_replace = QPushButton("Replace Selected")
+        self._btn_delete = QPushButton("Delete Selected")
+        for btn in (self._btn_select, self._btn_add_strip, self._btn_add_digit, self._btn_replace, self._btn_delete):
+            sidebar.addWidget(btn)
+
+        sidebar.addWidget(QLabel("Digit class"))
+        self._digit_combo = QComboBox()
+        for class_id in range(DIGIT_OFFSET, UNREADABLE_CLS + 1):
+            self._digit_combo.addItem(CLASS_NAMES[class_id], class_id)
+        sidebar.addWidget(self._digit_combo)
+
+        sidebar.addWidget(QLabel("Selected box class"))
+        self._selected_combo = QComboBox()
+        for class_id, name in enumerate(CLASS_NAMES):
+            self._selected_combo.addItem(name, class_id)
+        sidebar.addWidget(self._selected_combo)
+
+        self._reading_label = QLabel("Reading: -----")
+        self._reading_label.setObjectName("readingValue")
+        self._reading_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._reading_label.setFixedHeight(56)
+        sidebar.addWidget(self._reading_label)
+
+        self._summary_label = QLabel("")
+        self._summary_label.setWordWrap(True)
+        self._summary_label.setObjectName("detailPanel")
+        sidebar.addWidget(self._summary_label, stretch=1)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self._accept_if_valid)
+        buttons.rejected.connect(self.reject)
+        sidebar.addWidget(buttons)
+
+        layout.addLayout(sidebar, stretch=1)
+
+        self._btn_select.clicked.connect(lambda: self._canvas.set_mode("select"))
+        self._btn_add_strip.clicked.connect(lambda: self._canvas.set_mode("add_strip"))
+        self._btn_add_digit.clicked.connect(lambda: self._canvas.set_mode("add_digit"))
+        self._btn_replace.clicked.connect(lambda: self._canvas.set_mode("replace"))
+        self._btn_delete.clicked.connect(self._canvas.delete_selected)
+        self._digit_combo.currentIndexChanged.connect(self._sync_pending_digit_class)
+        self._selected_combo.currentIndexChanged.connect(self._sync_selected_box_class)
+        self._canvas.selection_changed.connect(self._on_selection_changed)
+        self._canvas.boxes_changed.connect(self._refresh_summary)
+        self._sync_pending_digit_class()
+        self._refresh_summary()
+
+    def _sync_pending_digit_class(self) -> None:
+        self._canvas.set_pending_class_id(int(self._digit_combo.currentData()))
+
+    def _sync_selected_box_class(self) -> None:
+        selected = self._canvas.selected_box()
+        if selected is None:
+            return
+        self._canvas.set_selected_class_id(int(self._selected_combo.currentData()))
+
+    def _on_selection_changed(self, index: int) -> None:
+        selected = self._canvas.selected_box()
+        self._selected_combo.setEnabled(selected is not None)
+        if selected is not None:
+            combo_index = self._selected_combo.findData(int(selected["cls"]))
+            if combo_index >= 0:
+                self._selected_combo.setCurrentIndex(combo_index)
+        self._refresh_summary()
+
+    def _refresh_summary(self) -> None:
+        detections = self._canvas.boxes()
+        digits = [det for det in detections if int(det["cls"]) != STRIP_CLASS_ID]
+        strips = [det for det in detections if int(det["cls"]) == STRIP_CLASS_ID]
+        reading = build_reading_from_detections(detections, expected_digits=NUM_DIGITS)
+        self._reading_label.setText(f"Reading: {reading}")
+        self._summary_label.setText(
+            f"Strip boxes: {len(strips)}\n"
+            f"Digit boxes: {len(digits)} / {NUM_DIGITS}\n"
+            "Tip: use Select / Move for quick repositioning, or Replace Selected to redraw a box."
+        )
+
+    def _accept_if_valid(self) -> None:
+        detections = self._canvas.boxes()
+        strips = [det for det in detections if int(det["cls"]) == STRIP_CLASS_ID]
+        digits = [det for det in detections if int(det["cls"]) != STRIP_CLASS_ID]
+        if len(strips) != 1:
+            QMessageBox.warning(self, "Invalid Annotation", "Please keep exactly one strip box.")
+            return
+        if len(digits) == 0 or len(digits) > NUM_DIGITS:
+            QMessageBox.warning(self, "Invalid Annotation", f"Please keep between 1 and {NUM_DIGITS} digit boxes.")
+            return
+        self._result_detections = detections
+        self.accept()
+
+    def result_detections(self) -> list[dict]:
+        return _clone_detection_list(self._result_detections)
 
 
 # ---------------------------------------------------------------------------
@@ -1232,9 +1706,15 @@ class YoloTesterWindow(QMainWindow):
         self._idx = -1
         self._rotation = 0
         self._model = None
+        self._model_path = ""
         self._raw_cv: np.ndarray | None = None
         self._annotated_cv: np.ndarray | None = None
         self._annotated_is_rotated = False
+        self._current_candidate: dict | None = None
+        self._current_candidates: list[dict] = []
+        self._review_store = ReviewStore(Path(__file__).resolve().parent / "corrections")
+        self._latest_review_map = self._review_store.load_latest_review_map()
+        self._current_review: dict | None = None
 
         # Persistent settings — remember last-used directories across restarts
         self._settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
@@ -1361,6 +1841,35 @@ class YoloTesterWindow(QMainWindow):
             metrics.addWidget(value_label, row, 1)
         results_layout.addLayout(metrics)
 
+        review_controls = QGridLayout()
+        review_controls.setHorizontalSpacing(10)
+        review_controls.setVerticalSpacing(8)
+
+        self._brand_combo = QComboBox()
+        self._brand_combo.setEditable(True)
+        self._brand_combo.addItems(["Unknown", "AsiaM", "Maxwinner"])
+        self._brand_combo.setCurrentText("Unknown")
+
+        self._btn_mark_correct = QPushButton("Mark Correct")
+        self._btn_correct_reading = QPushButton("Correct Reading")
+        self._btn_fix_detection = QPushButton("Fix Detection")
+        self._btn_needs_review = QPushButton("Needs Review")
+        self._btn_export_reviewed = QPushButton("Export Reviewed Cases")
+
+        review_controls.addWidget(QLabel("Meter Brand"), 0, 0)
+        review_controls.addWidget(self._brand_combo, 0, 1, 1, 2)
+        review_controls.addWidget(self._btn_mark_correct, 1, 0)
+        review_controls.addWidget(self._btn_correct_reading, 1, 1)
+        review_controls.addWidget(self._btn_fix_detection, 1, 2)
+        review_controls.addWidget(self._btn_needs_review, 2, 0)
+        review_controls.addWidget(self._btn_export_reviewed, 2, 1, 1, 2)
+        results_layout.addLayout(review_controls)
+
+        self._lbl_review_state = QLabel("Review state: none")
+        self._lbl_review_state.setObjectName("detailPanel")
+        self._lbl_review_state.setWordWrap(True)
+        results_layout.addWidget(self._lbl_review_state)
+
         detail_title = QLabel("Scan Summary")
         detail_title.setObjectName("metaLabel")
         results_layout.addWidget(detail_title)
@@ -1394,12 +1903,19 @@ class YoloTesterWindow(QMainWindow):
         self._btn_batch.clicked.connect(self._run_batch_read)
         self._btn_rotate_left.clicked.connect(self._rotate_left)
         self._btn_rotate_right.clicked.connect(self._rotate_right)
+        self._btn_mark_correct.clicked.connect(self._mark_current_correct)
+        self._btn_correct_reading.clicked.connect(self._correct_current_reading)
+        self._btn_fix_detection.clicked.connect(self._fix_current_detection)
+        self._btn_needs_review.clicked.connect(self._mark_needs_review)
+        self._btn_export_reviewed.clicked.connect(self._export_reviewed_cases)
 
         QShortcut(QKeySequence(Qt.Key.Key_Left), self, self._go_prev)
         QShortcut(QKeySequence(Qt.Key.Key_Right), self, self._go_next)
         QShortcut(QKeySequence(Qt.Key.Key_Space), self, self._run_read)
 
     def _reset_result_state(self) -> None:
+        self._current_candidate = None
+        self._current_candidates = []
         self._lbl_reading.setText("-----")
         self._lbl_detail.setText("Load an image and a trained YOLO model, then run a read.")
         self._set_status_badge("Idle")
@@ -1407,6 +1923,9 @@ class YoloTesterWindow(QMainWindow):
         self._lbl_digit_count.setText("--")
         self._lbl_window.setText("--")
         self._lbl_avg_conf.setText("--")
+        self._update_review_state_label()
+        if hasattr(self, "_btn_mark_correct"):
+            self._refresh_controls()
 
     def _set_status_badge(self, status: str) -> None:
         palette = {
@@ -1422,6 +1941,96 @@ class YoloTesterWindow(QMainWindow):
         self._lbl_status.setStyleSheet(
             f"background: {background}; color: {foreground}; font-weight: 700; border-radius: 12px; padding: 6px 12px;"
         )
+
+    def _current_image_path(self) -> Path | None:
+        if not self._images or self._idx < 0 or self._idx >= len(self._images):
+            return None
+        return self._images[self._idx]
+
+    def _current_visible_image(self) -> np.ndarray | None:
+        if self._raw_cv is None:
+            return None
+        return _rotate_cv(self._raw_cv, self._rotation)
+
+    def _current_review_brand(self) -> str:
+        return sanitize_brand(self._brand_combo.currentText())
+
+    def _load_existing_review_state(self) -> None:
+        image_path = self._current_image_path()
+        self._current_review = self._latest_review_map.get(str(image_path)) if image_path else None
+        if self._current_review is not None:
+            brand = str(self._current_review.get("brand", "")).strip()
+            if brand:
+                self._brand_combo.setCurrentText(brand)
+        self._update_review_state_label()
+
+    def _update_review_state_label(self) -> None:
+        if self._current_review is None:
+            self._lbl_review_state.setText("Review state: none yet for this image.")
+            return
+        review_type = str(self._current_review.get("review_type", "unknown"))
+        review_status = str(self._current_review.get("review_status", ""))
+        corrected = str(self._current_review.get("corrected_reading", ""))
+        brand = str(self._current_review.get("brand", "Unknown"))
+        self._lbl_review_state.setText(
+            f"Review state: {review_type} | status: {review_status or '--'} | brand: {brand} | corrected: {corrected or '--'}"
+        )
+
+    def _build_review_metadata(self) -> dict:
+        candidate = self._current_candidate
+        metadata = {
+            "rotation": self._rotation,
+            "tester_status": candidate["status"] if candidate else "No Detection",
+            "strip_confidence": float(candidate["strip_conf"]) if candidate else 0.0,
+            "digit_count": int(candidate["digit_count"]) if candidate else 0,
+            "digit_avg_confidence": float(candidate["digit_conf_avg"]) if candidate else 0.0,
+            "window_index": int(candidate["window_index"]) if candidate else 0,
+            "total_windows": int(candidate["total_windows"]) if candidate else 0,
+            "notes": candidate.get("notes", []) if candidate else [],
+        }
+        return metadata
+
+    def _save_review(
+        self,
+        *,
+        review_type: str,
+        review_status: str,
+        corrected_reading: str,
+        corrected_detections: list[dict],
+        copy_image: bool = False,
+    ) -> None:
+        image_path = self._current_image_path()
+        visible_image = self._current_visible_image()
+        if image_path is None or visible_image is None:
+            QMessageBox.warning(self, "No Image", "Load an image before saving a review.")
+            return
+        predicted_reading = self._current_candidate["reading"] if self._current_candidate else ""
+        original_detections = _selected_review_detections(self._current_candidate)
+        payload = self._review_store.save_review(
+            source_image_path=image_path,
+            source_image_bgr=visible_image,
+            review_type=review_type,
+            review_status=review_status,
+            brand=self._current_review_brand(),
+            model_path=self._model_path,
+            predicted_reading=predicted_reading,
+            corrected_reading=corrected_reading,
+            original_detections=original_detections,
+            corrected_detections=_clone_detection_list(corrected_detections),
+            metadata=self._build_review_metadata(),
+            copy_image=copy_image,
+        )
+        self._latest_review_map[str(image_path)] = payload
+        self._current_review = payload
+        self._update_review_state_label()
+
+    def _review_type_for_image(self, image_path: Path | None) -> str:
+        if image_path is None:
+            return "Unreviewed"
+        review = self._latest_review_map.get(str(image_path))
+        if review is None:
+            return "Unreviewed"
+        return str(review.get("review_type", "Unreviewed"))
 
     # ------------------------------------------------------------------
     # Settings helpers (mirrors main.py pattern)
@@ -1481,6 +2090,7 @@ class YoloTesterWindow(QMainWindow):
         self._annotated_cv = None
         self._annotated_is_rotated = False
         self._reset_result_state()
+        self._load_existing_review_state()
         self._display(reset_view=reset_view)
         total = len(self._images)
         self._lbl_name.setText(f"{path.name}  ({self._idx + 1} / {total})")
@@ -1541,6 +2151,7 @@ class YoloTesterWindow(QMainWindow):
             return
         try:
             self._model = YOLO(path)
+            self._model_path = path
             self._lbl_model.setText(f"Model: {Path(path).name}")
             self.statusBar().showMessage(f"Model loaded: {Path(path).name}")
             # Remember the folder this model came from
@@ -1549,6 +2160,7 @@ class YoloTesterWindow(QMainWindow):
             self._settings.setValue(SETTINGS_LAST_MODEL_DIR, model_dir)
         except Exception as exc:
             self._model = None
+            self._model_path = ""
             self._lbl_model.setText("Failed to load model")
             self.statusBar().showMessage(f"Model load error: {exc}")
             self._set_status_badge("Error")
@@ -1760,6 +2372,7 @@ class YoloTesterWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _update_result_ui(self, candidate: dict | None, scanned_windows: int, total_windows: int) -> None:
+        self._current_candidate = candidate
         if candidate is None:
             self._annotated_cv = None
             self._reset_result_state()
@@ -1801,6 +2414,8 @@ class YoloTesterWindow(QMainWindow):
         self.statusBar().showMessage(
             f"{candidate['status']}: {candidate['reading']} | digits {candidate['digit_count']}/{NUM_DIGITS} | window {candidate['window_index']}/{candidate['total_windows']}"
         )
+        self._update_review_state_label()
+        self._refresh_controls()
 
     # ------------------------------------------------------------------
     # Run Read — opens process preview, runs inference, closes on finish
@@ -1835,7 +2450,127 @@ class YoloTesterWindow(QMainWindow):
 
         total_windows = len(build_sliding_windows(visible_image.shape[1], visible_image.shape[0]))
         scanned_windows = len(candidates)
+        self._current_candidates = candidates
         self._update_result_ui(best_candidate, scanned_windows, total_windows)
+
+    def _mark_current_correct(self) -> None:
+        if self._current_candidate is None:
+            QMessageBox.information(self, "No Read Yet", "Run a read first, then mark the result.")
+            return
+        detections = _selected_review_detections(self._current_candidate)
+        self._save_review(
+            review_type="marked_correct",
+            review_status="Correct",
+            corrected_reading=self._current_candidate["reading"],
+            corrected_detections=detections,
+        )
+        self.statusBar().showMessage("Saved review: marked correct.")
+
+    def _correct_current_reading(self) -> None:
+        if self._current_candidate is None:
+            QMessageBox.information(self, "No Read Yet", "Run a read first, then correct the reading.")
+            return
+        if self._current_candidate.get("strip_det") is None or len(self._current_candidate.get("digit_dets", [])) != NUM_DIGITS:
+            QMessageBox.warning(
+                self,
+                "Use Detection Fix",
+                "This image does not have a trustworthy strip + 5 digits yet. Use 'Fix Detection' instead.",
+            )
+            return
+        current = str(self._current_candidate["reading"])
+        text, ok = QInputDialog.getText(
+            self,
+            "Correct Reading",
+            "Enter the true 5-character reading (digits or X):",
+            text=current,
+        )
+        if not ok:
+            return
+        corrected = text.strip().upper()
+        if len(corrected) != NUM_DIGITS or any((not ch.isdigit()) and ch != "X" for ch in corrected):
+            QMessageBox.warning(self, "Invalid Reading", "Use exactly 5 characters consisting of digits or X.")
+            return
+
+        detections = _selected_review_detections(self._current_candidate)
+        digit_dets = [det for det in detections if int(det["cls"]) != STRIP_CLASS_ID]
+        digit_dets.sort(key=lambda det: _box_center_x(det["box"]))
+        for idx, ch in enumerate(corrected):
+            digit_dets[idx]["cls"] = char_to_class_id(ch)
+            digit_dets[idx]["label"] = _style_name(digit_dets[idx]["cls"])
+        self._save_review(
+            review_type="reading_only",
+            review_status="Corrected Reading",
+            corrected_reading=corrected,
+            corrected_detections=detections,
+        )
+        self.statusBar().showMessage(f"Saved corrected reading: {corrected}")
+
+    def _fix_current_detection(self) -> None:
+        image = self._current_visible_image()
+        if image is None:
+            QMessageBox.information(self, "No Image", "Load an image first.")
+            return
+        detections = _selected_review_detections(self._current_candidate)
+        dialog = DetectionCorrectionDialog(image, detections, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        corrected_dets = dialog.result_detections()
+        corrected_reading = build_reading_from_detections(corrected_dets, expected_digits=NUM_DIGITS)
+        self._save_review(
+            review_type="detection_fixed",
+            review_status="Detection Fixed",
+            corrected_reading=corrected_reading,
+            corrected_detections=corrected_dets,
+        )
+        self.statusBar().showMessage(f"Saved corrected boxes for reading {corrected_reading}")
+
+    def _mark_needs_review(self) -> None:
+        if self._current_image_path() is None:
+            QMessageBox.information(self, "No Image", "Load an image first.")
+            return
+        corrected = self._current_candidate["reading"] if self._current_candidate else ""
+        detections = _selected_review_detections(self._current_candidate)
+        self._save_review(
+            review_type="unreadable_or_skip",
+            review_status="Needs Review",
+            corrected_reading=corrected,
+            corrected_detections=detections,
+        )
+        self.statusBar().showMessage("Saved review flag: needs review.")
+
+    def _export_reviewed_cases(self) -> None:
+        dialog = ExportReviewsDialog(self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        brand_filter, include_correct = dialog.values()
+        default_dir = self._review_store.paths.exports_dir / "review_export"
+        export_dir = QFileDialog.getExistingDirectory(
+            self,
+            "Select Export Folder",
+            str(default_dir),
+        )
+        if not export_dir:
+            return
+        result = self._review_store.export_reviews(
+            export_dir,
+            brand_filter=brand_filter,
+            include_marked_correct=include_correct,
+        )
+        QMessageBox.information(
+            self,
+            "Export Complete",
+            f"Exported {result['exported_count']} reviewed case(s).\nSkipped: {result['skipped_count']}\n\nFolder:\n{result['export_dir']}",
+        )
+        self.statusBar().showMessage(f"Reviewed cases exported: {result['exported_count']}")
+
+    def _open_image_from_batch(self, filename: str) -> None:
+        for idx, path in enumerate(self._images):
+            if path.name == filename:
+                self._idx = idx
+                self._load_image(reset_view=True)
+                self._refresh_controls()
+                self.statusBar().showMessage(f"Loaded batch image for review: {filename}")
+                return
 
     # ------------------------------------------------------------------
     # Batch Read — dispatch all images to QThreadPool, collect via signals
@@ -1851,6 +2586,8 @@ class YoloTesterWindow(QMainWindow):
 
         report_dialog = BatchReportDialog(total, self)
         report_dialog.set_folder(folder_str)
+        report_dialog.set_review_lookup(self._latest_review_map)
+        report_dialog.open_image_requested.connect(self._open_image_from_batch)
         report_dialog.show()
         QApplication.processEvents()
 
@@ -1899,6 +2636,11 @@ class YoloTesterWindow(QMainWindow):
         self._btn_next.setEnabled(has_images and self._idx < len(self._images) - 1)
         self._btn_read.setEnabled(has_images and has_model)
         self._btn_batch.setEnabled(has_images and has_model)
+        self._btn_mark_correct.setEnabled(has_images and self._current_candidate is not None)
+        self._btn_correct_reading.setEnabled(has_images and self._current_candidate is not None)
+        self._btn_fix_detection.setEnabled(has_images)
+        self._btn_needs_review.setEnabled(has_images)
+        self._btn_export_reviewed.setEnabled(True)
 
 
 # ---------------------------------------------------------------------------
