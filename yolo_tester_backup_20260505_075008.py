@@ -1994,31 +1994,6 @@ class YoloTesterWindow(QMainWindow):
         models_layout.addWidget(self._lbl_model_hint)
         side_layout.addWidget(models_group)
 
-        # ── Comparison Results (directly below Loaded Models) ─────────────────
-        compare_group = QGroupBox("Comparison Results")
-        compare_layout = QVBoxLayout(compare_group)
-        compare_layout.setSpacing(10)
-        self._tbl_compare = QTableWidget(0, 7)
-        self._tbl_compare.setHorizontalHeaderLabels(
-            ["Model", "Backend", "Reading", "Status", "Strip", "Digits", "Window"]
-        )
-        self._tbl_compare.verticalHeader().setVisible(False)
-        self._tbl_compare.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self._tbl_compare.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self._tbl_compare.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
-        self._tbl_compare.setMinimumHeight(220)
-        self._tbl_compare.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        for col in range(1, 7):
-            self._tbl_compare.horizontalHeader().setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
-        compare_layout.addWidget(self._tbl_compare)
-
-        self._lbl_compare_summary = QLabel("Run Compare Models to see side-by-side outputs for the current image.")
-        self._lbl_compare_summary.setObjectName("detailPanel")
-        self._lbl_compare_summary.setWordWrap(True)
-        compare_layout.addWidget(self._lbl_compare_summary)
-        side_layout.addWidget(compare_group)
-
-        # ── Read Result ───────────────────────────────────────────────────────
         results_group = QGroupBox("Read Result")
         results_layout = QVBoxLayout(results_group)
         results_layout.setSpacing(12)
@@ -2072,21 +2047,79 @@ class YoloTesterWindow(QMainWindow):
             metrics.addWidget(value_label, row, 1)
         results_layout.addLayout(metrics)
 
-        side_layout.addWidget(results_group)
-        side_layout.addStretch(1)
+        review_controls = QGridLayout()
+        review_controls.setHorizontalSpacing(10)
+        review_controls.setVerticalSpacing(8)
 
-        # Hidden widgets — kept as objects so existing logic doesn't crash
         self._brand_combo = QComboBox()
+        self._brand_combo.setEditable(True)
         self._brand_combo.addItems(["Unknown", "AsiaM", "Maxwinner"])
         self._brand_combo.setCurrentText("Unknown")
-        self._btn_mark_correct = QPushButton()
-        self._btn_correct_reading = QPushButton()
-        self._btn_fix_detection = QPushButton()
-        self._btn_needs_review = QPushButton()
-        self._btn_export_reviewed = QPushButton()
-        self._lbl_review_state = QLabel()
-        self._lbl_detail = QLabel()
+
+        self._btn_mark_correct = QPushButton("Mark Correct")
+        self._btn_correct_reading = QPushButton("Correct Reading")
+        self._btn_fix_detection = QPushButton("Fix Detection")
+        self._btn_needs_review = QPushButton("Needs Review")
+        self._btn_export_reviewed = QPushButton("Export Reviewed Cases")
+
+        review_controls.addWidget(QLabel("Meter Brand"), 0, 0)
+        review_controls.addWidget(self._brand_combo, 0, 1, 1, 2)
+        review_controls.addWidget(self._btn_mark_correct, 1, 0)
+        review_controls.addWidget(self._btn_correct_reading, 1, 1)
+        review_controls.addWidget(self._btn_fix_detection, 1, 2)
+        review_controls.addWidget(self._btn_needs_review, 2, 0)
+        review_controls.addWidget(self._btn_export_reviewed, 2, 1, 1, 2)
+        results_layout.addLayout(review_controls)
+
+        self._lbl_review_state = QLabel("Review state: none")
+        self._lbl_review_state.setObjectName("detailPanel")
+        self._lbl_review_state.setWordWrap(True)
+        results_layout.addWidget(self._lbl_review_state)
+
+        detail_title = QLabel("Scan Summary")
+        detail_title.setObjectName("metaLabel")
+        results_layout.addWidget(detail_title)
+
+        self._lbl_detail = QLabel("")
+        self._lbl_detail.setObjectName("detailPanel")
+        self._lbl_detail.setWordWrap(True)
         self._lbl_detail.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        self._lbl_detail.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        results_layout.addWidget(self._lbl_detail, stretch=1)
+
+        help_text = QLabel(
+            "Read behavior: class 0 = strip, classes 1..10 = digits 0..9, class 11 = unreadable. "
+            ".pt models use Ultralytics; .tflite models use TensorFlow Lite."
+        )
+        help_text.setObjectName("subtitleLabel")
+        help_text.setWordWrap(True)
+        results_layout.addWidget(help_text)
+
+        side_layout.addWidget(results_group)
+
+        compare_group = QGroupBox("Comparison Results")
+        compare_layout = QVBoxLayout(compare_group)
+        compare_layout.setSpacing(10)
+        self._tbl_compare = QTableWidget(0, 7)
+        self._tbl_compare.setHorizontalHeaderLabels(
+            ["Model", "Backend", "Reading", "Status", "Strip", "Digits", "Window"]
+        )
+        self._tbl_compare.verticalHeader().setVisible(False)
+        self._tbl_compare.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self._tbl_compare.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self._tbl_compare.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self._tbl_compare.setMinimumHeight(220)
+        self._tbl_compare.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        for col in range(1, 7):
+            self._tbl_compare.horizontalHeader().setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
+        compare_layout.addWidget(self._tbl_compare)
+
+        self._lbl_compare_summary = QLabel("Run Compare Models to see side-by-side outputs for the current image.")
+        self._lbl_compare_summary.setObjectName("detailPanel")
+        self._lbl_compare_summary.setWordWrap(True)
+        compare_layout.addWidget(self._lbl_compare_summary)
+        side_layout.addWidget(compare_group)
+        side_layout.addStretch(1)
 
         side_scroll.setWidget(side_panel)
         content.addWidget(side_scroll)
@@ -3030,10 +3063,4 @@ def main() -> None:
         print("          Install with: pip install ultralytics")
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
-    window = YoloTesterWindow()
-    window.show()
-    sys.exit(app.exec())
-
-
-if __name__ == "__main__":
-    main()
+    wind

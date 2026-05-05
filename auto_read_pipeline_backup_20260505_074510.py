@@ -131,9 +131,9 @@ def build_sliding_windows(
         seen.add(key)
         deduped.append(window)
 
-    # Always sort center-first, larger zoom first at equal distance.
-    # This guarantees processing starts at the middle and spirals outward
-    # at every zoom level — regardless of how many windows there are.
+    if len(deduped) <= max_windows:
+        return deduped
+
     image_center = np.array([image_width / 2.0, image_height / 2.0], dtype=np.float32)
 
     def window_rank(window: SlidingWindow) -> tuple[float, int]:
@@ -144,33 +144,7 @@ def build_sliding_windows(
         dist = float(np.linalg.norm(center - image_center))
         return dist, -window.size
 
-    sorted_windows = sorted(deduped, key=window_rank)
-
-    # Only cap if strictly necessary. When we do cap, keep the center-closest
-    # windows BUT always guarantee the four image corners are represented so
-    # nothing at the edges is silently missed.
-    if len(sorted_windows) <= max_windows:
-        return sorted_windows
-
-    kept = sorted_windows[:max_windows]
-    kept_keys = {(w.x, w.y, w.size) for w in kept}
-
-    # Corner anchors: top-left, top-right, bottom-left, bottom-right at largest size
-    largest = sizes[0]
-    corners = [
-        SlidingWindow(0,                          0,                           largest),
-        SlidingWindow(max(image_width - largest, 0), 0,                        largest),
-        SlidingWindow(0,                          max(image_height - largest, 0), largest),
-        SlidingWindow(max(image_width - largest, 0), max(image_height - largest, 0), largest),
-    ]
-    for corner in corners:
-        key = (corner.x, corner.y, corner.size)
-        if key not in kept_keys:
-            kept.append(corner)
-            kept_keys.add(key)
-
-    # Re-sort so the final list is still center-first
-    return sorted(kept, key=window_rank)
+    return sorted(deduped, key=window_rank)[:max_windows]
 
 
 def generate_strip_candidates(strip: np.ndarray) -> list[dict[str, Any]]:
